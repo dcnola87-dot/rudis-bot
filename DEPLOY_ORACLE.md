@@ -10,7 +10,7 @@ ssh ubuntu@YOUR_ORACLE_IP
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 python3-venv python3-pip tmux curl
+sudo apt install -y git python3 python3-venv python3-pip curl
 ```
 
 ## 3. Install Node + PM2
