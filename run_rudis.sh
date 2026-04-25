@@ -1,11 +1,12 @@
 #!/bin/zsh
-cd /Users/DJ/Desktop/rudis-bot
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
-PY="/Users/DJ/Desktop/rudis-bot/venv/bin/python"
+PY="$SCRIPT_DIR/venv/bin/python"
 
-source /Users/DJ/Desktop/rudis-bot/venv/bin/activate
+source "$SCRIPT_DIR/venv/bin/activate"
 
 # Kill old rbot session quietly
 tmux has-session -t rbot 2>/dev/null && tmux kill-session -t rbot

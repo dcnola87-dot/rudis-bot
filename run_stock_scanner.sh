@@ -1,11 +1,12 @@
 #!/bin/zsh
-cd /Users/DJ/Desktop/rudis-bot/legacy
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/legacy"
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
-PY="/Users/DJ/Desktop/rudis-bot/venv/bin/python"
+PY="$SCRIPT_DIR/venv/bin/python"
 
-source /Users/DJ/Desktop/rudis-bot/venv/bin/activate
+source "$SCRIPT_DIR/venv/bin/activate"
 
 tmux has-session -t rbot-stocks 2>/dev/null && tmux kill-session -t rbot-stocks
 

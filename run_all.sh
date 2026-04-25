@@ -1,5 +1,6 @@
 #!/bin/zsh
-cd /Users/DJ/Desktop/rudis-bot
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 ./run_rudis.sh
 ./run_helius_listener.sh
