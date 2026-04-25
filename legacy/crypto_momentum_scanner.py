@@ -665,14 +665,25 @@ def build_graduation_signal(candidate: dict, pair: dict, helius_asset: dict | No
 
 
 def format_graduation_msg(sig: dict) -> str:
-    conviction = "HIGH" if sig["score"] >= max(GRAD_MIN_SCORE + 15, 85) else "CONFIRMED"
+    score = int(sig.get("score") or 0)
+    if score >= 85:
+        tier = "🚀 HIGH CONVICTION"
+        warning = ""
+    elif score >= 75:
+        tier = "⚡ MOMENTUM PLAY"
+        warning = ""
+    else:
+        tier = "🎰 DEGEN PLAY"
+        warning = "\n⚠️ High risk — early stage, low liquidity"
+
     return (
-        f"🚀 **PUMP GRADUATION {conviction}** **{sig['symbol']}** | "
-        f"Score: **{sig['score']}** | Liquidity: ${sig['liquidity_usd']:,.0f} | "
+        f"{tier} **{sig['symbol']}** | "
+        f"Score: **{score}** | Liquidity: ${sig['liquidity_usd']:,.0f} | "
         f"Vol(24h): ${sig['volume_h24']:,.0f} | Txns(24h): {sig['txns_h24']} "
         f"({sig['buys_h24']} buys/{sig['sells_h24']} sells) | "
         f"Age: {sig['pair_age_hours']:.1f}h | Mint: `{sig['mint']}`"
         + (f" | Dex: {sig['pair_url']}" if sig["pair_url"] else "")
+        + warning
     )
 
 
