@@ -19,29 +19,40 @@ def discord(msg: str):
     except Exception:
         pass
 
-def in_rth(ts: datetime) -> bool:
-    # Regular Trading Hours: 8:30 AM – 3:00 PM CT
-    if ts.hour < 8:
-        return False
-    if ts.hour > 15:
-        return False
-    if ts.hour == 8 and ts.minute < 30:
-        return False
-    return True
+def current_session(ts: datetime) -> str | None:
+    mins = ts.hour * 60 + ts.minute
+    premarket_start = 3 * 60
+    rth_start = 8 * 60 + 30
+    ah_start = 15 * 60
+    ah_end = 18 * 60
+
+    if premarket_start <= mins < rth_start:
+        return "premarket"
+    if rth_start <= mins < ah_start:
+        return "rth"
+    if ah_start <= mins < ah_end:
+        return "afterhours"
+    return None
 
 started_today = None  # date we already announced
 
 while True:
     now = datetime.now(CT)
+    session = current_session(now)
 
-    if in_rth(now):
+    if session:
         # Send "live" ping once per day
         if started_today != now.date():
-            discord("✅ **Rudis RTH scanner is LIVE** (8:30–3:00 CT).")
+            discord("✅ **Rudis stock scanner is LIVE** (3:00 AM–6:00 PM CT).")
             started_today = now.date()
 
         # Run scanner (every ~60s)
-        subprocess.run(["python", "rth_momentum_scanner.py"])
+        env = os.environ.copy()
+        if session == "rth":
+            env["RTH_ALLOWED_SIGNALS"] = "WATCH,EARLY,CONFIRMED,FADING"
+        else:
+            env["RTH_ALLOWED_SIGNALS"] = "EARLY"
+        subprocess.run(["python", "rth_momentum_scanner.py"], env=env)
         time.sleep(60)
     else:
         time.sleep(60)

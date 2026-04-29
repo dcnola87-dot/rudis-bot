@@ -42,8 +42,18 @@ RTH_MOST_ACTIVES_TOP = int(os.getenv("RTH_MOST_ACTIVES_TOP", "50"))
 RTH_MOVERS_TOP = int(os.getenv("RTH_MOVERS_TOP", "25"))
 DEBUG_RTH = os.getenv("RTH_DEBUG", "0") == "1"
 POST_NO_SIGNAL = os.getenv("RTH_POST_NO_SIGNAL", "0") == "1"
+ALLOWED_SIGNALS = {
+    s.strip().upper()
+    for s in (os.getenv("RTH_ALLOWED_SIGNALS", "WATCH,EARLY,CONFIRMED,FADING") or "").split(",")
+    if s.strip()
+}
 
 SIGNAL_META = {
+    "WATCH": {
+        "emoji": "🔍",
+        "label": "WATCH",
+        "note": "Early watch - no confirmed momentum yet. Monitor for development.",
+    },
     "EARLY": {
         "emoji": "⚡",
         "label": "EARLY SIGNAL",
@@ -374,7 +384,7 @@ def passes_prefilter(symbol: str, snapshot: dict) -> bool:
 
         if not (0.50 <= price <= 5.00):
             return False
-        if volume < 500_000:
+        if volume < 250_000:
             return False
         if vwap <= 0:
             return False
@@ -396,7 +406,7 @@ def passes_prefilter(symbol: str, snapshot: dict) -> bool:
 
 def classify_signal(pct_change: float, rvol: float, volume: int, is_premarket: bool) -> str | None:
     """
-    Returns: 'EARLY', 'CONFIRMED', 'FADING', or None (no alert)
+    Returns: 'WATCH', 'EARLY', 'CONFIRMED', 'FADING', or None (no alert)
     """
     if rvol < 1.5 and pct_change > 10:
         return "FADING"
@@ -406,6 +416,9 @@ def classify_signal(pct_change: float, rvol: float, volume: int, is_premarket: b
 
     if rvol >= 3.0 and volume >= 1_000_000 and pct_change >= 5:
         return "CONFIRMED"
+
+    if 1.5 <= rvol < 2.0 and 2 <= pct_change < 5 and 250_000 <= volume < 1_000_000:
+        return "WATCH"
 
     return None
 
@@ -443,8 +456,6 @@ def analyze_symbol(sym, bars, snapshot):
         return None
 
     spike = cur_v / avg_v
-    if spike < VOL_SPIKE_X:
-        return None
 
     highs = [float(b.get("h") or 0) for b in bars[-LOOKBACK_BARS:]]
     recent_high = max(highs) if highs else 0
@@ -461,6 +472,10 @@ def analyze_symbol(sym, bars, snapshot):
     rvol = (volume / prev_day_volume) if prev_day_volume > 0 else spike
     signal = classify_signal(pct, rvol, volume, _is_premarket_or_opening_window())
     if signal is None:
+        return None
+    if signal in {"EARLY", "CONFIRMED", "FADING"} and spike < VOL_SPIKE_X:
+        return None
+    if signal.upper() not in ALLOWED_SIGNALS:
         return None
     catalyst = None
     signal_label = signal

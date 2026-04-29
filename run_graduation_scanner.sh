@@ -8,4 +8,4 @@ PY="$SCRIPT_DIR/venv/bin/python"
 
 source "$SCRIPT_DIR/venv/bin/activate"
 
-exec "$PY" legacy/crypto_momentum_scanner.py
+exec "$PY" legacy/crypto_loop.py

@@ -35,7 +35,7 @@ client = discord.Client(intents=intents)
 TICKER_PATTERNS = [
     re.compile(r"\*\*EARLY WATCH\*\*\s+([A-Z]{1,5})"),
     re.compile(r"\*\*FULL PLAY\*\*\s+([A-Z]{1,5})"),
-    re.compile(r"\*\*(?:EARLY SIGNAL|CONFIRMED|FADING)\*\*\s*\|\s*\*\*([A-Z]{1,5})\*\*"),
+    re.compile(r"\*\*(?:EARLY SIGNAL|EARLY \+ CATALYST|CONFIRMED|FADING|WATCH)\*\*\s*\|\s*\*\*([A-Z]{1,5})\*\*"),
     re.compile(r"\$([A-Z]{1,5})"),
 ]
 
