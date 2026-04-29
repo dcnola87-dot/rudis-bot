@@ -63,12 +63,14 @@ PUMPFUN_PROGRAM_ID=6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
 STOCKS_WEBHOOK=
 ALPACA_KEY=
 ALPACA_SECRET=
+RTH_FLOAT_CANDIDATES_PATH=/home/ubuntu/rudis-bot/float_candidates.csv
 ```
 
 Important:
 
 - Set `CRYPTO_CONFIRMED_WEBHOOK` to your Discord webhook for `crypto-confirmed`
 - Do not set `RUDIS_EXECUTION_CONTEXT_URL` yet unless that endpoint is actually live
+- Place `float_candidates.csv` in the repo root if you want the stock scanner to use the merged Finviz low-float candidate list
 
 ## 7. Start All Processes In PM2
 

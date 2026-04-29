@@ -31,10 +31,11 @@ intents.reactions = True
 client = discord.Client(intents=intents)
 
 # ---------- HELPERS ----------
-# Match our alert text (supports "**EARLY WATCH** TICK", "**FULL PLAY** TICK", or "$TICK")
+# Match our alert text (supports legacy formats, new signal labels, or "$TICK")
 TICKER_PATTERNS = [
     re.compile(r"\*\*EARLY WATCH\*\*\s+([A-Z]{1,5})"),
     re.compile(r"\*\*FULL PLAY\*\*\s+([A-Z]{1,5})"),
+    re.compile(r"\*\*(?:EARLY SIGNAL|CONFIRMED|FADING)\*\*\s*\|\s*\*\*([A-Z]{1,5})\*\*"),
     re.compile(r"\$([A-Z]{1,5})"),
 ]
 
