@@ -40,34 +40,62 @@ MAX_SYMBOLS = int(os.getenv("RTH_MAX_SYMBOLS", "75"))             # cap to avoid
 RTH_RANKED_POOL = int(os.getenv("RTH_RANKED_POOL", "100"))        # how many ranked names to request before trimming
 RTH_MOST_ACTIVES_TOP = int(os.getenv("RTH_MOST_ACTIVES_TOP", "50"))
 RTH_MOVERS_TOP = int(os.getenv("RTH_MOVERS_TOP", "25"))
-DEBUG_RTH = os.getenv("RTH_DEBUG", "0") == "1"
-POST_NO_SIGNAL = os.getenv("RTH_POST_NO_SIGNAL", "0") == "1"
+DEBUG_RTH = os.getenv("STOCK_DEBUG", os.getenv("RTH_DEBUG", "0")) == "1"
+POST_NO_SIGNAL = os.getenv("STOCK_POST_NO_SIGNAL", os.getenv("RTH_POST_NO_SIGNAL", "0")) == "1"
 ALLOWED_SIGNALS = {
     s.strip().upper()
     for s in (os.getenv("RTH_ALLOWED_SIGNALS", "WATCH,EARLY,CONFIRMED,FADING") or "").split(",")
     if s.strip()
 }
 
-SIGNAL_META = {
+SESSION_SIGNAL_META = {
     "WATCH": {
-        "emoji": "🔍",
-        "label": "WATCH",
-        "note": "Early watch - no confirmed momentum yet. Monitor for development.",
+        "building": True,
     },
     "EARLY": {
-        "emoji": "⚡",
-        "label": "EARLY SIGNAL",
-        "note": "Move not yet confirmed - trade at your own risk, not advice.",
+        "building": True,
     },
     "CONFIRMED": {
-        "emoji": "🔥",
-        "label": "CONFIRMED",
-        "note": "Volume + momentum validated. Second leg potential.",
+        "building": False,
     },
     "FADING": {
-        "emoji": "📉",
-        "label": "FADING",
-        "note": "Volume dropping off. Move may be exhausted - proceed with caution.",
+        "building": False,
+    },
+}
+
+TIER_PROFILES = {
+    "CONFIRMED": {
+        "emoji": "✅",
+        "label": "CONFIRMED",
+        "price_min": 2.0,
+        "price_max": 25.0,
+        "min_daily_vol": 750_000,
+        "min_rvol": 2.0,
+        "min_pct": 5.0,
+        "min_spike": VOL_SPIKE_X,
+        "tagline": "Gap-and-go / continuation",
+    },
+    "CASINO": {
+        "emoji": "🎰",
+        "label": "CASINO",
+        "price_min": 0.30,
+        "price_max": 8.0,
+        "min_daily_vol": 250_000,
+        "min_rvol": 3.0,
+        "min_pct": 8.0,
+        "min_spike": max(VOL_SPIKE_X, 3.0),
+        "tagline": "Low Float Squeeze",
+    },
+    "EARLY": {
+        "emoji": "🟡",
+        "label": "EARLY",
+        "price_min": 1.0,
+        "price_max": 15.0,
+        "min_daily_vol": 500_000,
+        "min_rvol": 1.5,
+        "min_pct": 2.0,
+        "min_spike": 1.5,
+        "tagline": "Building",
     },
 }
 
@@ -376,13 +404,13 @@ def fetch_recent_8k(symbol: str) -> dict | None:
 
 
 def passes_prefilter(symbol: str, snapshot: dict) -> bool:
-    """Price, volume, and basic liquidity gate before signal logic runs."""
+    """Broad liquidity gate before tier-specific logic runs."""
     try:
         price = float(snapshot["latestTrade"]["p"])
         volume = int(snapshot["dailyBar"]["v"])
         vwap = float(snapshot["dailyBar"]["vw"])
 
-        if not (0.50 <= price <= 5.00):
+        if not (0.30 <= price <= 25.00):
             return False
         if volume < 250_000:
             return False
@@ -420,6 +448,23 @@ def classify_signal(pct_change: float, rvol: float, volume: int, is_premarket: b
     if 1.5 <= rvol < 2.0 and 2 <= pct_change < 5 and 250_000 <= volume < 1_000_000:
         return "WATCH"
 
+    return None
+
+
+def choose_tier(price: float, pct_change: float, rvol: float, volume: int, spike: float) -> str | None:
+    for tier_name in ("CONFIRMED", "CASINO", "EARLY"):
+        tier = TIER_PROFILES[tier_name]
+        if not (tier["price_min"] <= price <= tier["price_max"]):
+            continue
+        if volume < tier["min_daily_vol"]:
+            continue
+        if rvol < tier["min_rvol"]:
+            continue
+        if pct_change < tier["min_pct"]:
+            continue
+        if spike < tier["min_spike"]:
+            continue
+        return tier_name
     return None
 
 
@@ -470,19 +515,19 @@ def analyze_symbol(sym, bars, snapshot):
     near_high = (recent_high > 0) and (price >= recent_high * NEAR_HIGH_PCT)
     pct = (price - prev_close) / prev_close * 100 if prev_close else 0
     rvol = (volume / prev_day_volume) if prev_day_volume > 0 else spike
-    signal = classify_signal(pct, rvol, volume, _is_premarket_or_opening_window())
-    if signal is None:
+    session_signal = classify_signal(pct, rvol, volume, _is_premarket_or_opening_window())
+    if session_signal is None:
         return None
-    if signal in {"EARLY", "CONFIRMED", "FADING"} and spike < VOL_SPIKE_X:
+    if session_signal.upper() not in ALLOWED_SIGNALS:
         return None
-    if signal.upper() not in ALLOWED_SIGNALS:
+
+    tier = choose_tier(price, pct, rvol, volume, spike)
+    if tier is None:
         return None
+
     catalyst = None
-    signal_label = signal
-    if signal == "EARLY":
+    if tier == "EARLY":
         catalyst = fetch_recent_8k(sym)
-        if catalyst:
-            signal_label = "EARLY + CATALYST"
 
     return {
         "symbol": sym,
@@ -490,24 +535,31 @@ def analyze_symbol(sym, bars, snapshot):
         "pct_change": pct,
         "rvol": rvol,
         "volume": volume,
-        "signal": signal,
-        "signal_label": signal_label,
+        "session_signal": session_signal,
+        "tier": tier,
         "filing_type": catalyst["filing_type"] if catalyst else None,
         "is_float_candidate": sym.upper() in FLOAT_CANDIDATES,
         "recent_high": recent_high,
         "near_high": near_high,
+        "spike": spike,
     }
 
 def format_msg(sig):
-    meta = SIGNAL_META[sig["signal"]]
-    candidate_tag = "  ·  LOW-FLOAT CANDIDATE" if sig["symbol"].upper() in FLOAT_CANDIDATES else ""
-    label = sig.get("signal_label") or meta["label"]
-    filing_note = f" | Filing: {sig['filing_type']}" if sig.get("filing_type") else ""
+    tier = TIER_PROFILES[sig["tier"]]
+    notes = []
+    if sig["tier"] == "CASINO":
+        notes.append(tier["tagline"])
+    elif SESSION_SIGNAL_META.get(sig["session_signal"], {}).get("building"):
+        notes.append("Building")
+    else:
+        notes.append(tier["tagline"])
+    if sig.get("filing_type"):
+        notes.append(sig["filing_type"])
     return (
-        f"{meta['emoji']} **{label}** | **{sig['symbol']}**{candidate_tag}\n"
-        f"Price: ${sig['price']:.2f} | Change: {sig['pct_change']:+.2f}% | "
-        f"Vol: {sig['volume']:,} ({sig['rvol']:.1f}x RVOL){filing_note}\n"
-        f"_{meta['note']}_"
+        f"{tier['emoji']} **{tier['label']}** | **{sig['symbol']}** | "
+        f"{sig['pct_change']:+.1f}% | RVOL {sig['rvol']:.1f}x | "
+        f"Vol Spike {sig['spike']:.1f}x"
+        f"{' | ' + ' | '.join(notes) if notes else ''}"
     )
 
 def main():
