@@ -31,8 +31,10 @@ ASSETS_CACHE_PATH = Path(os.getenv("RTH_ASSETS_CACHE_PATH", ".assets_cache.json"
 SYMBOL_SOURCE = os.getenv("RTH_SYMBOL_SOURCE", "dynamic").strip().lower()
 
 # ---- Tunables (RTH params) ----
-TIMEFRAME = os.getenv("RTH_TIMEFRAME", "5Min")
-LOOKBACK_BARS = int(os.getenv("RTH_LOOKBACK_BARS", "24"))          # last ~2 hours (24 x 5min)
+EARLY_TIMEFRAME = os.getenv("RTH_EARLY_TIMEFRAME", "1Min")
+CONFIRMED_TIMEFRAME = os.getenv("RTH_CONFIRMED_TIMEFRAME", "5Min")
+EARLY_LOOKBACK_BARS = int(os.getenv("RTH_EARLY_LOOKBACK_BARS", "30"))
+CONFIRMED_LOOKBACK_BARS = int(os.getenv("RTH_CONFIRMED_LOOKBACK_BARS", "24"))
 MIN_LAST_VOL = int(os.getenv("RTH_MIN_LAST_VOL", "20000"))        # ignore tiny prints
 VOL_SPIKE_X = float(os.getenv("RTH_VOL_SPIKE_X", "2.5"))          # current bar vol must be >= avg_vol * this
 NEAR_HIGH_PCT = float(os.getenv("RTH_NEAR_HIGH_PCT", "0.98"))     # close must be within X% of recent high
@@ -42,9 +44,10 @@ RTH_MOST_ACTIVES_TOP = int(os.getenv("RTH_MOST_ACTIVES_TOP", "50"))
 RTH_MOVERS_TOP = int(os.getenv("RTH_MOVERS_TOP", "25"))
 DEBUG_RTH = os.getenv("STOCK_DEBUG", os.getenv("RTH_DEBUG", "0")) == "1"
 POST_NO_SIGNAL = os.getenv("STOCK_POST_NO_SIGNAL", os.getenv("RTH_POST_NO_SIGNAL", "0")) == "1"
+REJECTION_SUMMARY_LIMIT = int(os.getenv("RTH_REJECTION_SUMMARY_LIMIT", "10"))
 ALLOWED_SIGNALS = {
     s.strip().upper()
-    for s in (os.getenv("RTH_ALLOWED_SIGNALS", "WATCH,EARLY,CONFIRMED,FADING") or "").split(",")
+    for s in (os.getenv("RTH_ALLOWED_SIGNALS", "WATCH,EARLY,CONFIRMED,EXTENDED,FADING") or "").split(",")
     if s.strip()
 }
 
@@ -56,6 +59,9 @@ SESSION_SIGNAL_META = {
         "building": True,
     },
     "CONFIRMED": {
+        "building": False,
+    },
+    "EXTENDED": {
         "building": False,
     },
     "FADING": {
@@ -70,10 +76,44 @@ TIER_PROFILES = {
         "price_min": 2.0,
         "price_max": 25.0,
         "min_daily_vol": 750_000,
-        "min_rvol": 2.0,
-        "min_pct": 5.0,
-        "min_spike": VOL_SPIKE_X,
+        "min_rvol": 3.0,
+        "min_pct": 8.0,
+        "min_spike": max(VOL_SPIKE_X, 2.0),
+        "max_pct": None,
+        "timeframe": CONFIRMED_TIMEFRAME,
+        "lookback_bars": CONFIRMED_LOOKBACK_BARS,
+        "require_vwap_hold": True,
         "tagline": "Gap-and-go / continuation",
+    },
+    "WATCH": {
+        "emoji": "👀",
+        "label": "WATCH",
+        "price_min": 0.30,
+        "price_max": 25.0,
+        "min_daily_vol": 250_000,
+        "min_rvol": 1.5,
+        "min_pct": 2.0,
+        "min_spike": 1.2,
+        "max_pct": 12.0,
+        "timeframe": EARLY_TIMEFRAME,
+        "lookback_bars": EARLY_LOOKBACK_BARS,
+        "require_vwap_hold": False,
+        "tagline": "Setting up",
+    },
+    "EXTENDED": {
+        "emoji": "🟠",
+        "label": "EXTENDED",
+        "price_min": 1.0,
+        "price_max": 25.0,
+        "min_daily_vol": 500_000,
+        "min_rvol": 2.0,
+        "min_pct": 12.0,
+        "min_spike": 1.3,
+        "max_pct": None,
+        "timeframe": EARLY_TIMEFRAME,
+        "lookback_bars": EARLY_LOOKBACK_BARS,
+        "require_vwap_hold": False,
+        "tagline": "Late extension / do not chase",
     },
     "CASINO": {
         "emoji": "🎰",
@@ -83,18 +123,26 @@ TIER_PROFILES = {
         "min_daily_vol": 250_000,
         "min_rvol": 3.0,
         "min_pct": 8.0,
-        "min_spike": max(VOL_SPIKE_X, 3.0),
+        "min_spike": 1.5,
+        "max_pct": None,
+        "timeframe": EARLY_TIMEFRAME,
+        "lookback_bars": EARLY_LOOKBACK_BARS,
+        "require_vwap_hold": False,
         "tagline": "Low Float Squeeze",
     },
     "EARLY": {
         "emoji": "🟡",
         "label": "EARLY",
         "price_min": 1.0,
-        "price_max": 15.0,
+        "price_max": 25.0,
         "min_daily_vol": 500_000,
-        "min_rvol": 1.5,
-        "min_pct": 2.0,
+        "min_rvol": 2.0,
+        "min_pct": 3.0,
         "min_spike": 1.5,
+        "max_pct": 12.0,
+        "timeframe": EARLY_TIMEFRAME,
+        "lookback_bars": EARLY_LOOKBACK_BARS,
+        "require_vwap_hold": False,
         "tagline": "Building",
     },
 }
@@ -293,26 +341,33 @@ def alpaca_headers():
         "APCA-API-SECRET-KEY": ALPACA_SECRET or "",
     }
 
-def fetch_bars(symbols):
+def _timeframe_minutes(timeframe: str) -> int:
+    tf = timeframe.strip().lower()
+    if tf.endswith("min"):
+        try:
+            return max(int(tf[:-3]), 1)
+        except ValueError:
+            return 1
+    return 5
+
+
+def fetch_bars(symbols, timeframe: str, lookback_bars: int):
     """
-    Uses Alpaca data API v2 multi-symbol bars:
-      GET /v2/stocks/bars?symbols=...&timeframe=5Min&start=...&limit=...
+    Uses Alpaca data API v2 multi-symbol bars for the requested timeframe.
     """
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise RuntimeError("Missing ALPACA_KEY / ALPACA_SECRET in .env")
 
     end = datetime.now(CT)
-    start = end - timedelta(minutes=5 * (LOOKBACK_BARS + 2))
+    start = end - timedelta(minutes=_timeframe_minutes(timeframe) * (lookback_bars + 2))
 
     params = {
         "symbols": ",".join(symbols),
-        "timeframe": TIMEFRAME,
+        "timeframe": timeframe,
         "start": start.astimezone().isoformat(),
         "end": end.astimezone().isoformat(),
-        "limit": LOOKBACK_BARS + 2,
+        "limit": lookback_bars + 2,
         "adjustment": "raw",
-        # Most Alpaca accounts require specifying the data feed for market data.
-        # `iex` is the safest default; if you have SIP access you can set ALPACA_FEED=sip in .env.
         "feed": ALPACA_FEED,
     }
 
@@ -403,69 +458,87 @@ def fetch_recent_8k(symbol: str) -> dict | None:
         return None
 
 
-def passes_prefilter(symbol: str, snapshot: dict) -> bool:
+def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
     """Broad liquidity gate before tier-specific logic runs."""
     try:
         price = float(snapshot["latestTrade"]["p"])
         volume = int(snapshot["dailyBar"]["v"])
         vwap = float(snapshot["dailyBar"]["vw"])
+        vwap_distance = abs(price - vwap) / vwap if vwap > 0 else math.inf
+        reasons = []
 
         if not (0.30 <= price <= 25.00):
-            return False
+            reasons.append(f"price {price:.2f} outside 0.30-25.00")
         if volume < 250_000:
-            return False
+            reasons.append(f"volume {volume:,} < 250,000")
         if vwap <= 0:
-            return False
-        if abs(price - vwap) / vwap > 0.40:
-            return False
+            reasons.append("VWAP missing")
+        elif vwap_distance > 0.40:
+            reasons.append(f"VWAP distance {vwap_distance:.1%} > 40%")
         if symbol.upper() in FLOAT_CANDIDATES:
-            return True
+            return {
+                "passed": not reasons,
+                "reasons": reasons,
+                "price": price,
+                "volume": volume,
+                "vwap": vwap,
+                "vwap_distance": vwap_distance,
+            }
         if FLOAT_CANDIDATES:
             if DEBUG_RTH:
                 discord(f"🧪 RTH debug: {symbol} not in float candidates, allowing pass-through as unknown")
         elif DEBUG_RTH:
             discord(f"🧪 RTH debug: float candidates list empty, allowing {symbol} through as unknown")
-        return True
+        return {
+            "passed": not reasons,
+            "reasons": reasons,
+            "price": price,
+            "volume": volume,
+            "vwap": vwap,
+            "vwap_distance": vwap_distance,
+        }
     except (KeyError, TypeError, ValueError):
         if DEBUG_RTH:
             discord(f"🧪 RTH debug: prefilter skip {symbol} missing snapshot fields")
-        return False
+        return {
+            "passed": False,
+            "reasons": ["snapshot fields missing"],
+            "price": None,
+            "volume": None,
+            "vwap": None,
+            "vwap_distance": None,
+        }
 
 
-def classify_signal(pct_change: float, rvol: float, volume: int, is_premarket: bool) -> str | None:
-    """
-    Returns: 'WATCH', 'EARLY', 'CONFIRMED', 'FADING', or None (no alert)
-    """
-    if rvol < 1.5 and pct_change > 10:
-        return "FADING"
+def evaluate_bar_metrics(bars: list[dict], lookback_bars: int) -> dict:
+    if not bars or len(bars) < 3:
+        return {"ok": False, "reasons": ["not enough bars"]}
 
-    if is_premarket or (rvol >= 2.0 and volume < 1_000_000 and pct_change >= 5):
-        return "EARLY"
+    cur = bars[-1]
+    cur_v = float(cur.get("v") or 0)
+    if cur_v < MIN_LAST_VOL:
+        return {
+            "ok": False,
+            "current_bar_volume": cur_v,
+            "reasons": [f"current bar volume {cur_v:,.0f} < {MIN_LAST_VOL:,}"],
+        }
 
-    if rvol >= 3.0 and volume >= 1_000_000 and pct_change >= 5:
-        return "CONFIRMED"
+    prior = bars[-(lookback_bars + 1):-1]
+    vols = [float(b.get("v") or 0) for b in prior]
+    avg_v = sum(vols) / max(len(vols), 1)
+    if avg_v <= 0:
+        return {"ok": False, "reasons": ["average bar volume unavailable"]}
 
-    if 1.5 <= rvol < 2.0 and 2 <= pct_change < 5 and 250_000 <= volume < 1_000_000:
-        return "WATCH"
-
-    return None
-
-
-def choose_tier(price: float, pct_change: float, rvol: float, volume: int, spike: float) -> str | None:
-    for tier_name in ("CONFIRMED", "CASINO", "EARLY"):
-        tier = TIER_PROFILES[tier_name]
-        if not (tier["price_min"] <= price <= tier["price_max"]):
-            continue
-        if volume < tier["min_daily_vol"]:
-            continue
-        if rvol < tier["min_rvol"]:
-            continue
-        if pct_change < tier["min_pct"]:
-            continue
-        if spike < tier["min_spike"]:
-            continue
-        return tier_name
-    return None
+    spike = cur_v / avg_v
+    highs = [float(b.get("h") or 0) for b in bars[-lookback_bars:]]
+    recent_high = max(highs) if highs else 0.0
+    return {
+        "ok": True,
+        "current_bar_volume": cur_v,
+        "avg_bar_volume": avg_v,
+        "spike": spike,
+        "recent_high": recent_high,
+    }
 
 
 def _is_premarket_or_opening_window() -> bool:
@@ -474,56 +547,142 @@ def _is_premarket_or_opening_window() -> bool:
         return True
     return now.hour == 9 and now.minute < 45
 
-def analyze_symbol(sym, bars, snapshot):
-    """
-    bars: list of dicts (time-ordered)
-    returns None or dict with signal info
-    """
-    if not bars or len(bars) < 8:
-        return None
 
-    if not passes_prefilter(sym, snapshot):
-        return None
+def choose_signal_and_tier(
+    price: float,
+    pct_change: float,
+    rvol: float,
+    volume: int,
+    vwap: float,
+    metrics_by_timeframe: dict,
+    is_float_candidate: bool,
+) -> tuple[str | None, str | None, list[str]]:
+    reasons = []
 
-    # Use the most recent completed-ish bar as "current"
-    cur = bars[-1]
+    if rvol < 1.2 and pct_change > 10:
+        return "FADING", None, ["low RVOL versus extended move"]
 
-    cur_v = float(cur.get("v") or 0)
-    if cur_v < MIN_LAST_VOL:
-        return None
+    if 1.5 <= rvol < 2.0 and 2.0 <= pct_change < 3.0 and volume >= 250_000:
+        return "WATCH", "WATCH", []
 
-    # avg vol over prior N bars (exclude current)
-    prior = bars[-(LOOKBACK_BARS+1):-1]
-    vols = [float(b.get("v") or 0) for b in prior]
-    avg_v = sum(vols) / max(len(vols), 1)
+    early_metrics = metrics_by_timeframe.get(EARLY_TIMEFRAME) or {}
+    confirmed_metrics = metrics_by_timeframe.get(CONFIRMED_TIMEFRAME) or {}
 
-    if avg_v <= 0:
-        return None
+    for tier_name in ("CONFIRMED", "EXTENDED", "CASINO", "EARLY"):
+        tier = TIER_PROFILES[tier_name]
+        tier_reasons = []
+        metrics = metrics_by_timeframe.get(tier["timeframe"]) or {}
+        if not metrics.get("ok"):
+            tier_reasons.extend(metrics.get("reasons") or ["bar metrics unavailable"])
+        if not (tier["price_min"] <= price <= tier["price_max"]):
+            tier_reasons.append(f"price {price:.2f} outside {tier['price_min']:.2f}-{tier['price_max']:.2f}")
+        if volume < tier["min_daily_vol"]:
+            tier_reasons.append(f"volume {volume:,} < {tier['min_daily_vol']:,}")
+        if rvol < tier["min_rvol"]:
+            tier_reasons.append(f"RVOL {rvol:.1f}x < {tier['min_rvol']:.1f}x")
+        if pct_change < tier["min_pct"]:
+            tier_reasons.append(f"pct move {pct_change:+.1f}% < {tier['min_pct']:.1f}%")
+        max_pct = tier.get("max_pct")
+        if max_pct is not None and pct_change > max_pct:
+            tier_reasons.append(f"pct move {pct_change:+.1f}% > {max_pct:.1f}% anti-chase")
+        spike = float(metrics.get("spike") or 0.0)
+        if spike < tier["min_spike"]:
+            tier_reasons.append(f"bar spike {spike:.1f}x < {tier['min_spike']:.1f}x")
+        if tier["require_vwap_hold"] and price < vwap:
+            tier_reasons.append(f"below VWAP by {(vwap - price) / vwap:.1%}")
+        if tier_name == "EARLY" and vwap > 0 and price < vwap * 0.98:
+            tier_reasons.append(f"too far below VWAP ({(vwap - price) / vwap:.1%})")
+        if tier_name == "CASINO" and not is_float_candidate and price > 8.0:
+            tier_reasons.append("casino profile reserved for sub-$8 squeezes")
 
-    spike = cur_v / avg_v
+        if not tier_reasons:
+            session_signal = "CONFIRMED" if tier_name in {"CONFIRMED", "EXTENDED"} else tier_name
+            return session_signal, tier_name, []
+        reasons.extend(f"{tier_name}: {reason}" for reason in tier_reasons[:2])
 
-    highs = [float(b.get("h") or 0) for b in bars[-LOOKBACK_BARS:]]
-    recent_high = max(highs) if highs else 0
+    if early_metrics.get("ok") and pct_change > 0 and rvol > 1.0:
+        return None, None, reasons or ["not enough early momentum yet"]
+    if confirmed_metrics.get("ok") and pct_change > 0:
+        return None, None, reasons or ["confirmed setup not ready"]
+    return None, None, reasons or ["no qualifying setup"]
+
+
+def analyze_symbol(sym, bars_by_timeframe, snapshot):
+    prefilter = evaluate_prefilter(sym, snapshot)
+    if not prefilter["passed"]:
+        return None, {
+            "symbol": sym,
+            "score": 0.0,
+            "reasons": prefilter["reasons"],
+            "price": prefilter.get("price"),
+            "volume": prefilter.get("volume"),
+            "vwap_distance": prefilter.get("vwap_distance"),
+        }
+
     try:
         price = float(snapshot["latestTrade"]["p"])
         volume = int(snapshot["dailyBar"]["v"])
+        vwap = float(snapshot["dailyBar"]["vw"])
         prev_day_volume = int(snapshot["prevDailyBar"]["v"])
         prev_close = float(snapshot["prevDailyBar"]["c"])
     except (KeyError, TypeError, ValueError):
-        return None
+        return None, {
+            "symbol": sym,
+            "score": 0.0,
+            "reasons": ["snapshot fields missing during analysis"],
+        }
 
-    near_high = (recent_high > 0) and (price >= recent_high * NEAR_HIGH_PCT)
+    metrics_by_timeframe = {}
+    for timeframe, lookback in (
+        (EARLY_TIMEFRAME, EARLY_LOOKBACK_BARS),
+        (CONFIRMED_TIMEFRAME, CONFIRMED_LOOKBACK_BARS),
+    ):
+        bars = bars_by_timeframe.get(timeframe) or []
+        metrics_by_timeframe[timeframe] = evaluate_bar_metrics(bars, lookback)
+
     pct = (price - prev_close) / prev_close * 100 if prev_close else 0
-    rvol = (volume / prev_day_volume) if prev_day_volume > 0 else spike
-    session_signal = classify_signal(pct, rvol, volume, _is_premarket_or_opening_window())
-    if session_signal is None:
-        return None
-    if session_signal.upper() not in ALLOWED_SIGNALS:
-        return None
+    rvol = (volume / prev_day_volume) if prev_day_volume > 0 else float((metrics_by_timeframe.get(EARLY_TIMEFRAME) or {}).get("spike") or 0.0)
+    session_signal, tier, fail_reasons = choose_signal_and_tier(
+        price=price,
+        pct_change=pct,
+        rvol=rvol,
+        volume=volume,
+        vwap=vwap,
+        metrics_by_timeframe=metrics_by_timeframe,
+        is_float_candidate=sym.upper() in FLOAT_CANDIDATES,
+    )
+    early_metrics = metrics_by_timeframe.get(EARLY_TIMEFRAME) or {}
+    confirmed_metrics = metrics_by_timeframe.get(CONFIRMED_TIMEFRAME) or {}
+    primary_metrics = confirmed_metrics if tier == "CONFIRMED" else early_metrics
+    recent_high = float(primary_metrics.get("recent_high") or 0.0)
+    near_high = (recent_high > 0) and (price >= recent_high * NEAR_HIGH_PCT)
+    spike = float(primary_metrics.get("spike") or 0.0)
+    reject_score = 0.0
+    reject_score += min(max(pct, 0.0) / 12.0, 1.0) * 30.0
+    reject_score += min(max(rvol, 0.0) / 3.0, 1.0) * 25.0
+    reject_score += min(max(float(early_metrics.get("spike") or 0.0), 0.0) / 2.0, 1.0) * 25.0
+    reject_score += min(max(volume, 0) / 1_000_000.0, 1.0) * 10.0
+    if prefilter.get("vwap_distance") is not None:
+        reject_score += max(0.0, 1.0 - min(prefilter["vwap_distance"] / 0.10, 1.0)) * 10.0
 
-    tier = choose_tier(price, pct, rvol, volume, spike)
-    if tier is None:
-        return None
+    rejection = {
+        "symbol": sym,
+        "score": reject_score,
+        "reasons": fail_reasons,
+        "price": price,
+        "pct_change": pct,
+        "rvol": rvol,
+        "volume": volume,
+        "vwap_distance": prefilter.get("vwap_distance"),
+        "bar_spike_1m": float(early_metrics.get("spike") or 0.0),
+        "bar_spike_5m": float(confirmed_metrics.get("spike") or 0.0),
+    }
+
+    if session_signal is None or tier is None:
+        return None, rejection
+    if session_signal.upper() not in ALLOWED_SIGNALS:
+        rejection["reasons"] = [f"signal {session_signal} filtered by RTH_ALLOWED_SIGNALS"]
+        return None, rejection
 
     catalyst = None
     if tier == "EARLY":
@@ -542,7 +701,11 @@ def analyze_symbol(sym, bars, snapshot):
         "recent_high": recent_high,
         "near_high": near_high,
         "spike": spike,
-    }
+        "spike_1m": float(early_metrics.get("spike") or 0.0),
+        "spike_5m": float(confirmed_metrics.get("spike") or 0.0),
+        "vwap": vwap,
+        "vwap_distance": prefilter.get("vwap_distance"),
+    }, rejection
 
 def format_msg(sig):
     tier = TIER_PROFILES[sig["tier"]]
@@ -562,18 +725,50 @@ def format_msg(sig):
         f"{' | ' + ' | '.join(notes) if notes else ''}"
     )
 
+
+def print_rejection_summary(rejections: list[dict]):
+    if REJECTION_SUMMARY_LIMIT <= 0:
+        return
+    eligible = [item for item in rejections if item.get("reasons")]
+    if not eligible:
+        print("RTH rejects: none")
+        return
+
+    ranked = sorted(eligible, key=lambda item: item.get("score", 0.0), reverse=True)[:REJECTION_SUMMARY_LIMIT]
+    print("\nRTH rejection summary")
+    for item in ranked:
+        parts = []
+        if item.get("price") is not None:
+            parts.append(f"px {item['price']:.2f}")
+        if item.get("pct_change") is not None:
+            parts.append(f"move {item['pct_change']:+.1f}%")
+        if item.get("rvol") is not None:
+            parts.append(f"rvol {item['rvol']:.1f}x")
+        if item.get("volume") is not None:
+            parts.append(f"vol {int(item['volume']):,}")
+        if item.get("vwap_distance") is not None:
+            parts.append(f"vwap_dist {item['vwap_distance']:.1%}")
+        if item.get("bar_spike_1m") is not None:
+            parts.append(f"1m_spike {item['bar_spike_1m']:.1f}x")
+        if item.get("bar_spike_5m") is not None:
+            parts.append(f"5m_spike {item['bar_spike_5m']:.1f}x")
+        reason_text = "; ".join(item["reasons"][:3])
+        print(f" - {item['symbol']}: {', '.join(parts)} -> {reason_text}")
+
 def main():
     syms = load_symbols()
     if DEBUG_RTH:
         discord(
             "🧪 RTH scanner run: "
-            f"timeframe={TIMEFRAME} lookback={LOOKBACK_BARS} "
+            f"early_tf={EARLY_TIMEFRAME} early_lookback={EARLY_LOOKBACK_BARS} "
+            f"confirmed_tf={CONFIRMED_TIMEFRAME} confirmed_lookback={CONFIRMED_LOOKBACK_BARS} "
             f"min_vol={MIN_LAST_VOL} spike_x={VOL_SPIKE_X} near_high={NEAR_HIGH_PCT} "
             f"symbols={len(syms)} feed={os.getenv('ALPACA_FEED','iex')}"
         )
     # Chunk symbols to avoid big query strings / rate limits
     CHUNK = 50
     hits = 0
+    rejections = []
 
     for i in range(0, len(syms), CHUNK):
         chunk = syms[i:i+CHUNK]
@@ -583,25 +778,32 @@ def main():
             discord(f"⚠️ RTH scanner error: {e}")
             return
 
-        candidates = [sym for sym in chunk if passes_prefilter(sym, snapshots.get(sym) or {})]
-        if not candidates:
-            time.sleep(0.25)
-            continue
-
         try:
-            bars_map = fetch_bars(candidates)
+            early_bars_map = fetch_bars(chunk, EARLY_TIMEFRAME, EARLY_LOOKBACK_BARS)
+            confirmed_bars_map = fetch_bars(chunk, CONFIRMED_TIMEFRAME, CONFIRMED_LOOKBACK_BARS)
         except Exception as e:
             discord(f"⚠️ RTH scanner error: {e}")
             return
 
-        for sym, bars in bars_map.items():
-            sig = analyze_symbol(sym, bars, snapshots.get(sym) or {})
+        for sym in chunk:
+            sig, rejection = analyze_symbol(
+                sym,
+                {
+                    EARLY_TIMEFRAME: early_bars_map.get(sym) or [],
+                    CONFIRMED_TIMEFRAME: confirmed_bars_map.get(sym) or [],
+                },
+                snapshots.get(sym) or {},
+            )
             if sig:
                 discord(format_msg(sig))
                 hits += 1
+            elif rejection:
+                rejections.append(rejection)
 
         # small pause between chunks
         time.sleep(0.25)
+
+    print_rejection_summary(rejections)
 
     if hits == 0 and (POST_NO_SIGNAL or DEBUG_RTH):
         discord("ℹ️ RTH scanner: no signals this run.")

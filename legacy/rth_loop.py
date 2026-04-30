@@ -1,4 +1,4 @@
-import os, time, subprocess, requests
+import os, sys, time, subprocess, requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -34,6 +34,24 @@ def current_session(ts: datetime) -> str | None:
         return "afterhours"
     return None
 
+
+def scan_interval_seconds(ts: datetime, session: str | None) -> int:
+    if session == "premarket":
+        return 15
+    if session == "rth":
+        mins = ts.hour * 60 + ts.minute
+        rth_start = 8 * 60 + 30
+        first_hour_end = 9 * 60 + 30
+        last_hour_start = 14 * 60
+        if rth_start <= mins < first_hour_end:
+            return 15
+        if mins >= last_hour_start:
+            return 15
+        return 30
+    if session == "afterhours":
+        return 30
+    return 60
+
 started_today = None  # date we already announced
 
 while True:
@@ -46,13 +64,13 @@ while True:
             discord("✅ **Rudis stock scanner is LIVE** (3:00 AM–6:00 PM CT).")
             started_today = now.date()
 
-        # Run scanner (every ~60s)
+        # Run scanner on a tighter cadence during active windows.
         env = os.environ.copy()
         if session == "rth":
-            env["RTH_ALLOWED_SIGNALS"] = "WATCH,EARLY,CONFIRMED,FADING"
+            env["RTH_ALLOWED_SIGNALS"] = "WATCH,EARLY,CONFIRMED,EXTENDED,FADING"
         else:
-            env["RTH_ALLOWED_SIGNALS"] = "EARLY"
-        subprocess.run(["python", "rth_momentum_scanner.py"], env=env)
-        time.sleep(60)
+            env["RTH_ALLOWED_SIGNALS"] = "EARLY,CONFIRMED,EXTENDED"
+        subprocess.run([sys.executable, "rth_momentum_scanner.py"], env=env)
+        time.sleep(scan_interval_seconds(now, session))
     else:
         time.sleep(60)
