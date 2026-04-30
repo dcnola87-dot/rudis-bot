@@ -2,3 +2,6 @@ aiohttp>=3.10,<4
 discord.py>=2.4,<3
 python-dotenv>=1.0,<2
 requests>=2.31,<3
+pandas>=2.2,<3
+yfinance>=0.2,<1
+alpaca-trade-api>=3,<4
