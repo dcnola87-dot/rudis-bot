@@ -37,11 +37,12 @@ EARLY_TIMEFRAME = os.getenv("RTH_EARLY_TIMEFRAME", "1Min")
 CONFIRMED_TIMEFRAME = os.getenv("RTH_CONFIRMED_TIMEFRAME", "5Min")
 EARLY_LOOKBACK_BARS = int(os.getenv("RTH_EARLY_LOOKBACK_BARS", "30"))
 CONFIRMED_LOOKBACK_BARS = int(os.getenv("RTH_CONFIRMED_LOOKBACK_BARS", "24"))
-MIN_LAST_VOL = int(os.getenv("RTH_MIN_LAST_VOL", "20000"))        # ignore tiny prints
-VOL_SPIKE_X = float(os.getenv("RTH_VOL_SPIKE_X", "2.5"))          # current bar vol must be >= avg_vol * this
+MIN_LAST_VOL = int(os.getenv("RTH_MIN_LAST_VOL", "20000"))        # legacy knob; adaptive spike logic is preferred
+VOL_SPIKE_X = float(os.getenv("RTH_VOL_SPIKE_X", "2.0"))          # current bar vol must be >= avg_vol * this
 NEAR_HIGH_PCT = float(os.getenv("RTH_NEAR_HIGH_PCT", "0.98"))     # close must be within X% of recent high
-MAX_SYMBOLS = int(os.getenv("RTH_MAX_SYMBOLS", "75"))             # baseline cap to avoid rate limits
-PREMARKET_MAX_SYMBOLS = int(os.getenv("RTH_PREMARKET_MAX_SYMBOLS", "200"))
+MAX_SYMBOLS = int(os.getenv("RTH_MAX_SYMBOLS", "750"))            # regular-session cap
+PREMARKET_MAX_SYMBOLS = int(os.getenv("RTH_PREMARKET_MAX_SYMBOLS", "1000"))
+AFTERHOURS_MAX_SYMBOLS = int(os.getenv("RTH_AFTERHOURS_MAX_SYMBOLS", "500"))
 RTH_RANKED_POOL = int(os.getenv("RTH_RANKED_POOL", "100"))        # how many ranked names to request before trimming
 RTH_MOST_ACTIVES_TOP = int(os.getenv("RTH_MOST_ACTIVES_TOP", "50"))
 RTH_MOVERS_TOP = int(os.getenv("RTH_MOVERS_TOP", "25"))
@@ -545,7 +546,7 @@ def load_symbols():
       4) .assets_cache.json with { "symbols": [...] }
       5) fallback small list
     """
-    session_cap = PREMARKET_MAX_SYMBOLS if _is_premarket_or_opening_window() else MAX_SYMBOLS
+    session_cap = session_symbol_cap()
 
     # 1) explicit watchlist override
     wl = os.getenv("RTH_WATCHLIST", "").strip()
@@ -814,12 +815,6 @@ def evaluate_bar_metrics(bars: list[dict], lookback_bars: int) -> dict:
 
     cur = bars[-1]
     cur_v = float(cur.get("v") or 0)
-    if cur_v < MIN_LAST_VOL:
-        return {
-            "ok": False,
-            "current_bar_volume": cur_v,
-            "reasons": [f"current bar volume {cur_v:,.0f} < {MIN_LAST_VOL:,}"],
-        }
 
     prior = bars[-(lookback_bars + 1):-1]
     vols = [float(b.get("v") or 0) for b in prior]
@@ -844,6 +839,49 @@ def _is_premarket_or_opening_window() -> bool:
     if now.hour < 9 or (now.hour == 9 and now.minute < 30):
         return True
     return now.hour == 9 and now.minute < 45
+
+
+def current_market_phase() -> str:
+    now = datetime.now(ET)
+    mins = now.hour * 60 + now.minute
+    pm_open = 4 * 60
+    rth_open = 9 * 60 + 30
+    midday_start = 11 * 60
+    power_hour_start = 14 * 60
+    ah_start = 16 * 60
+    ah_end = 20 * 60
+
+    if pm_open <= mins < rth_open:
+        return "premarket"
+    if rth_open <= mins < midday_start:
+        return "rth"
+    if midday_start <= mins < power_hour_start:
+        return "midday"
+    if power_hour_start <= mins < ah_start:
+        return "rth"
+    if ah_start <= mins < ah_end:
+        return "afterhours"
+    return "offhours"
+
+
+def session_symbol_cap() -> int:
+    phase = current_market_phase()
+    if phase == "premarket":
+        return PREMARKET_MAX_SYMBOLS
+    if phase == "afterhours":
+        return AFTERHOURS_MAX_SYMBOLS
+    return MAX_SYMBOLS
+
+
+def session_rvol_thresholds() -> dict[str, float]:
+    phase = current_market_phase()
+    if phase == "premarket":
+        return {"watch": 1.2, "early": 1.5, "confirmed": 2.0}
+    if phase == "midday":
+        return {"watch": 1.0, "early": 1.2, "confirmed": 1.8}
+    if phase == "afterhours":
+        return {"watch": 1.2, "early": 1.5, "confirmed": 2.0}
+    return {"watch": 1.5, "early": 2.0, "confirmed": 2.5}
 
 
 def _is_opening_fallback_window() -> bool:
@@ -885,11 +923,12 @@ def choose_signal_and_tier(
 ) -> tuple[str | None, str | None, list[str]]:
     reasons = []
     opening_fallback = _is_opening_fallback_window()
+    rvol_thresholds = session_rvol_thresholds()
 
     if rvol < 1.2 and pct_change > 10:
         return "FADING", None, ["classified FADING: low RVOL versus extended move"]
 
-    if 1.5 <= rvol < 2.0 and 2.0 <= pct_change < 3.0 and volume >= 250_000:
+    if rvol_thresholds["watch"] <= rvol < rvol_thresholds["early"] and 2.0 <= pct_change < 3.0 and volume >= 250_000:
         return "WATCH", "WATCH", []
 
     early_metrics = metrics_by_timeframe.get(EARLY_TIMEFRAME) or {}
@@ -905,8 +944,13 @@ def choose_signal_and_tier(
             tier_reasons.append(f"price {price:.2f} outside {tier['price_min']:.2f}-{tier['price_max']:.2f}")
         if volume < tier["min_daily_vol"]:
             tier_reasons.append(f"volume {volume:,} < {tier['min_daily_vol']:,}")
-        if rvol < tier["min_rvol"]:
-            tier_reasons.append(f"RVOL {rvol:.1f}x < {tier['min_rvol']:.1f}x")
+        min_rvol = tier["min_rvol"]
+        if tier_name == "EARLY":
+            min_rvol = rvol_thresholds["early"]
+        elif tier_name == "CONFIRMED":
+            min_rvol = rvol_thresholds["confirmed"]
+        if rvol < min_rvol:
+            tier_reasons.append(f"RVOL {rvol:.1f}x < {min_rvol:.1f}x")
         if pct_change < tier["min_pct"]:
             tier_reasons.append(f"pct move {pct_change:+.1f}% < {tier['min_pct']:.1f}%")
         max_pct = tier.get("max_pct")
@@ -918,9 +962,14 @@ def choose_signal_and_tier(
                 and volume >= 500_000
             ):
                 tier_reasons.append(f"pct move {pct_change:+.1f}% > {max_pct:.1f}% anti-chase")
+        min_spike = tier["min_spike"]
+        if tier_name == "CONFIRMED":
+            min_spike = 2.0
+        elif tier_name == "EARLY":
+            min_spike = 1.5
         spike = float(metrics.get("spike") or 0.0)
-        if spike < tier["min_spike"]:
-            tier_reasons.append(f"bar spike {spike:.1f}x < {tier['min_spike']:.1f}x")
+        if spike < min_spike:
+            tier_reasons.append(f"bar spike {spike:.1f}x < {min_spike:.1f}x")
         if tier["require_vwap_hold"] and price < vwap:
             tier_reasons.append(f"below VWAP by {(vwap - price) / vwap:.1%}")
         if tier_name == "EARLY" and vwap > 0 and price < vwap * 0.98:
@@ -934,8 +983,7 @@ def choose_signal_and_tier(
                 tier_reasons = [reason for reason in tier_reasons if not reason.startswith("bar spike ")]
 
         if not tier_reasons:
-            session_signal = "CONFIRMED" if tier_name in {"CONFIRMED", "EXTENDED"} else tier_name
-            return session_signal, tier_name, []
+            return tier_name, tier_name, []
         reasons.extend(f"{tier_name}: {reason}" for reason in tier_reasons[:2])
 
     if early_metrics.get("ok") and pct_change > 0 and rvol > 1.0:
