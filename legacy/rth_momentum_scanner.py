@@ -28,6 +28,7 @@ DATA_BASE = os.getenv("ALPACA_DATA_BARS_URL", "https://data.alpaca.markets/v2/st
 ALPACA_FEED = os.getenv("ALPACA_FEED", "iex")
 ALPACA_TIMEOUT = int(os.getenv("ALPACA_TIMEOUT", "20"))
 ASSETS_CACHE_PATH = Path(os.getenv("RTH_ASSETS_CACHE_PATH", ".assets_cache.json"))
+SIGNAL_CACHE_PATH = Path(os.getenv("RTH_SIGNAL_CACHE_PATH", ".rth_signal_cache.json"))
 SYMBOL_SOURCE = os.getenv("RTH_SYMBOL_SOURCE", "dynamic").strip().lower()
 
 # ---- Tunables (RTH params) ----
@@ -48,6 +49,7 @@ RTH_TOP_RVOL_TOP = int(os.getenv("RTH_TOP_RVOL_TOP", "40"))
 RTH_SUB10_MOMO_TOP = int(os.getenv("RTH_SUB10_MOMO_TOP", "40"))
 RTH_DISCOVERY_ACTIVE_SAMPLE = int(os.getenv("RTH_DISCOVERY_ACTIVE_SAMPLE", "500"))
 OPENING_FALLBACK_MINUTES = int(os.getenv("RTH_OPENING_FALLBACK_MINUTES", "20"))
+SIGNAL_COOLDOWN_SEC = int(os.getenv("RTH_SIGNAL_COOLDOWN_SEC", "900"))
 DEBUG_RTH = os.getenv("STOCK_DEBUG", os.getenv("RTH_DEBUG", "0")) == "1"
 DEBUG_MISSES = os.getenv("STOCK_DEBUG_MISSES", "0") == "1"
 DEBUG_MISS_SYMBOLS = {
@@ -184,6 +186,55 @@ def debug_miss(symbol: str, stage: str, detail: str):
     if not debug_miss_enabled(symbol):
         return
     print(f"[MISS_DEBUG] {symbol.upper()} | {stage} | {detail}", flush=True)
+
+
+def _cache_template() -> dict:
+    return {"day": "", "signals": {}}
+
+
+def load_signal_cache() -> dict:
+    if SIGNAL_CACHE_PATH.exists():
+        try:
+            raw = json.loads(SIGNAL_CACHE_PATH.read_text())
+            if isinstance(raw, dict):
+                raw.setdefault("day", "")
+                raw.setdefault("signals", {})
+                return raw
+        except Exception:
+            pass
+    return _cache_template()
+
+
+def save_signal_cache(cache: dict):
+    try:
+        SIGNAL_CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+
+def reset_signal_cache(cache: dict) -> dict:
+    today = datetime.now(CT).strftime("%Y-%m-%d")
+    if cache.get("day") != today:
+        return {"day": today, "signals": {}}
+    cache.setdefault("signals", {})
+    return cache
+
+
+def signal_cache_key(sig: dict) -> str:
+    return f"{sig['symbol'].upper()}::{sig['session_signal'].upper()}::{sig['tier'].upper()}"
+
+
+def should_post_signal(sig: dict, cache: dict, now_ts: float) -> tuple[bool, str | None]:
+    key = signal_cache_key(sig)
+    last_ts = float((cache.get("signals") or {}).get(key) or 0.0)
+    if last_ts and now_ts - last_ts < SIGNAL_COOLDOWN_SEC:
+        return False, key
+    return True, key
+
+
+def mark_signal_posted(cache: dict, key: str, now_ts: float):
+    cache.setdefault("signals", {})
+    cache["signals"][key] = now_ts
 
 
 def _clean_symbols(values):
@@ -1062,6 +1113,8 @@ def print_rejection_summary(rejections: list[dict]):
 
 def main():
     syms = load_symbols()
+    signal_cache = reset_signal_cache(load_signal_cache())
+    now_ts = time.time()
     if debug_miss_enabled():
         missing = sorted(symbol for symbol in DEBUG_MISS_SYMBOLS if symbol not in syms)
         for symbol in missing:
@@ -1104,14 +1157,21 @@ def main():
                 snapshots.get(sym) or {},
             )
             if sig:
-                discord(format_msg(sig))
-                hits += 1
+                should_post, cache_key = should_post_signal(sig, signal_cache, now_ts)
+                if should_post:
+                    discord(format_msg(sig))
+                    if cache_key is not None:
+                        mark_signal_posted(signal_cache, cache_key, now_ts)
+                    hits += 1
+                elif debug_miss_enabled(sig["symbol"]):
+                    debug_miss(sig["symbol"], "result", f"not_alerted cooldown_dedupe key={cache_key}")
             elif rejection:
                 rejections.append(rejection)
 
         # small pause between chunks
         time.sleep(0.25)
 
+    save_signal_cache(signal_cache)
     print_rejection_summary(rejections)
 
     if hits == 0 and (POST_NO_SIGNAL or DEBUG_RTH):
