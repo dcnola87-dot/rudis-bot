@@ -49,6 +49,7 @@ RTH_MOVERS_TOP = int(os.getenv("RTH_MOVERS_TOP", "25"))
 RTH_TOP_GAINERS_TOP = int(os.getenv("RTH_TOP_GAINERS_TOP", "30"))
 RTH_TOP_RVOL_TOP = int(os.getenv("RTH_TOP_RVOL_TOP", "40"))
 RTH_SUB10_MOMO_TOP = int(os.getenv("RTH_SUB10_MOMO_TOP", "40"))
+RTH_MICROCAP_MOMO_TOP = int(os.getenv("RTH_MICROCAP_MOMO_TOP", "60"))
 RTH_DISCOVERY_ACTIVE_SAMPLE = int(os.getenv("RTH_DISCOVERY_ACTIVE_SAMPLE", "500"))
 OPENING_FALLBACK_MINUTES = int(os.getenv("RTH_OPENING_FALLBACK_MINUTES", "20"))
 SIGNAL_COOLDOWN_SEC = int(os.getenv("RTH_SIGNAL_COOLDOWN_SEC", "900"))
@@ -153,12 +154,12 @@ TIER_PROFILES = {
         "price_max": 25.0,
         "min_daily_vol": 500_000,
         "min_rvol": 2.0,
-        "min_pct": 3.0,
+        "min_pct": 4.0,
         "min_spike": 1.5,
         "max_pct": 12.0,
         "timeframe": EARLY_TIMEFRAME,
         "lookback_bars": EARLY_LOOKBACK_BARS,
-        "require_vwap_hold": False,
+        "require_vwap_hold": True,
         "tagline": "Building",
     },
 }
@@ -461,9 +462,9 @@ def _snapshot_metric(snapshot: dict) -> dict | None:
     }
 
 
-def rank_snapshot_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
+def rank_snapshot_symbols(symbols: list[str]) -> tuple[list[str], list[str], list[str]]:
     if not symbols or not ALPACA_KEY or not ALPACA_SECRET:
-        return [], []
+        return [], [], []
 
     metrics = []
     chunk_size = 50
@@ -499,7 +500,24 @@ def rank_snapshot_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
         if 0.30 <= metric["price"] <= 10.0 and metric["pct_change"] > 0
     ][:RTH_SUB10_MOMO_TOP]
 
-    return top_rvol, sub10_momo
+    microcap_momo = [
+        sym for sym, metric in sorted(
+            metrics,
+            key=lambda item: (
+                item[0] in FLOAT_CANDIDATES,
+                item[1]["pct_change"],
+                item[1]["rvol"],
+                item[1]["volume"],
+            ),
+            reverse=True,
+        )
+        if 0.30 <= metric["price"] <= 2.0
+        and metric["pct_change"] >= 6.0
+        and metric["rvol"] >= 1.5
+        and metric["volume"] >= 250_000
+    ][:RTH_MICROCAP_MOMO_TOP]
+
+    return top_rvol, sub10_momo, microcap_momo
 
 
 def rank_priority_symbols(symbols: list[str]) -> list[str]:
@@ -526,8 +544,16 @@ def rank_priority_symbols(symbols: list[str]) -> list[str]:
             score += min(metric["volume"] / 250_000.0, 20.0) * 3.0
             if 0.30 <= metric["price"] <= 10.0:
                 score += 80.0
-            if sym in FLOAT_CANDIDATES:
+            if 0.30 <= metric["price"] <= 2.0:
+                score += 140.0
+            if 0.30 <= metric["price"] <= 1.0:
                 score += 60.0
+            if metric["pct_change"] >= 12.0:
+                score += 35.0
+            if metric["rvol"] >= 3.0:
+                score += 45.0
+            if sym in FLOAT_CANDIDATES:
+                score += 80.0
             metrics.append((sym, score, metric))
 
     ranked = sorted(
@@ -569,10 +595,11 @@ def load_symbols():
             + active[:max(RTH_DISCOVERY_ACTIVE_SAMPLE, session_cap)]
         )
         priority = rank_priority_symbols(discovery_pool)
-        top_rvol, sub10_momo = rank_snapshot_symbols(discovery_pool)
+        top_rvol, sub10_momo, microcap_momo = rank_snapshot_symbols(discovery_pool)
 
         syms = _clean_symbols(
-            priority
+            microcap_momo
+            + priority
             + top_gainers
             + top_rvol
             + sub10_momo
@@ -583,14 +610,15 @@ def load_symbols():
         if DEBUG_RTH:
             discord(
                 "🧪 RTH debug: discovery "
-                f"priority={len(priority)} gainers={len(top_gainers)} rvol={len(top_rvol)} "
-                f"sub10={len(sub10_momo)} low_float={len(low_float)} "
+                f"microcap={len(microcap_momo)} priority={len(priority)} gainers={len(top_gainers)} "
+                f"rvol={len(top_rvol)} sub10={len(sub10_momo)} low_float={len(low_float)} "
                 f"most_active={len(most_active)} active={len(active)} cap={session_cap}"
             )
         if syms:
             if debug_miss_enabled():
                 final_syms = syms[:session_cap]
                 discovery_sets = {
+                    "microcap_momo": set(microcap_momo),
                     "priority": set(priority),
                     "top_gainers": set(top_gainers),
                     "top_rvol": set(top_rvol),
@@ -974,12 +1002,16 @@ def choose_signal_and_tier(
             tier_reasons.append(f"below VWAP by {(vwap - price) / vwap:.1%}")
         if tier_name == "EARLY" and vwap > 0 and price < vwap * 0.98:
             tier_reasons.append(f"too far below VWAP ({(vwap - price) / vwap:.1%})")
+        if tier_name == "EARLY":
+            recent_high = float(metrics.get("recent_high") or 0.0)
+            if recent_high > 0 and price < recent_high * 0.985:
+                tier_reasons.append(f"not close enough to highs ({price / recent_high:.1%} of recent high)")
         if tier_name == "CASINO" and not is_float_candidate and price > 8.0:
             tier_reasons.append("casino profile reserved for sub-$8 squeezes")
 
         if opening_fallback and tier_name in {"EARLY", "CASINO"}:
             tier_reasons = [reason for reason in tier_reasons if "not enough bars" not in reason]
-            if volume >= 500_000 and rvol >= max(tier["min_rvol"], 2.5):
+            if volume >= 750_000 and rvol >= max(tier["min_rvol"], 3.0):
                 tier_reasons = [reason for reason in tier_reasons if not reason.startswith("bar spike ")]
 
         if not tier_reasons:
