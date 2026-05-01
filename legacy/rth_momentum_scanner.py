@@ -29,6 +29,7 @@ ALPACA_FEED = os.getenv("ALPACA_FEED", "iex")
 ALPACA_TIMEOUT = int(os.getenv("ALPACA_TIMEOUT", "20"))
 ASSETS_CACHE_PATH = Path(os.getenv("RTH_ASSETS_CACHE_PATH", ".assets_cache.json"))
 SIGNAL_CACHE_PATH = Path(os.getenv("RTH_SIGNAL_CACHE_PATH", ".rth_signal_cache.json"))
+SIGNAL_LOG_PATH = Path(os.getenv("RTH_SIGNAL_LOG_PATH", "logs/stock_signal_calls.jsonl"))
 SYMBOL_SOURCE = os.getenv("RTH_SYMBOL_SOURCE", "dynamic").strip().lower()
 
 # ---- Tunables (RTH params) ----
@@ -208,6 +209,35 @@ def load_signal_cache() -> dict:
 def save_signal_cache(cache: dict):
     try:
         SIGNAL_CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+
+def append_signal_log(sig: dict):
+    payload = {
+        "logged_at_utc": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "logged_at_et": datetime.now(ET).isoformat(),
+        "symbol": sig["symbol"],
+        "session_signal": sig["session_signal"],
+        "tier": sig["tier"],
+        "price": sig["price"],
+        "pct_change": sig["pct_change"],
+        "rvol": sig["rvol"],
+        "volume": sig["volume"],
+        "spike": sig["spike"],
+        "spike_1m": sig.get("spike_1m"),
+        "spike_5m": sig.get("spike_5m"),
+        "vwap": sig.get("vwap"),
+        "vwap_distance": sig.get("vwap_distance"),
+        "recent_high": sig.get("recent_high"),
+        "near_high": sig.get("near_high"),
+        "is_float_candidate": sig.get("is_float_candidate"),
+        "filing_type": sig.get("filing_type"),
+    }
+    try:
+        SIGNAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SIGNAL_LOG_PATH.open("a") as f:
+            f.write(json.dumps(payload) + "\n")
     except Exception:
         pass
 
@@ -1160,6 +1190,7 @@ def main():
                 should_post, cache_key = should_post_signal(sig, signal_cache, now_ts)
                 if should_post:
                     discord(format_msg(sig))
+                    append_signal_log(sig)
                     if cache_key is not None:
                         mark_signal_posted(signal_cache, cache_key, now_ts)
                     hits += 1
