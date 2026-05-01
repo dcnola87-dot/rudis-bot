@@ -38,11 +38,22 @@ CONFIRMED_LOOKBACK_BARS = int(os.getenv("RTH_CONFIRMED_LOOKBACK_BARS", "24"))
 MIN_LAST_VOL = int(os.getenv("RTH_MIN_LAST_VOL", "20000"))        # ignore tiny prints
 VOL_SPIKE_X = float(os.getenv("RTH_VOL_SPIKE_X", "2.5"))          # current bar vol must be >= avg_vol * this
 NEAR_HIGH_PCT = float(os.getenv("RTH_NEAR_HIGH_PCT", "0.98"))     # close must be within X% of recent high
-MAX_SYMBOLS = int(os.getenv("RTH_MAX_SYMBOLS", "75"))             # cap to avoid rate limits
+MAX_SYMBOLS = int(os.getenv("RTH_MAX_SYMBOLS", "75"))             # baseline cap to avoid rate limits
+PREMARKET_MAX_SYMBOLS = int(os.getenv("RTH_PREMARKET_MAX_SYMBOLS", "200"))
 RTH_RANKED_POOL = int(os.getenv("RTH_RANKED_POOL", "100"))        # how many ranked names to request before trimming
 RTH_MOST_ACTIVES_TOP = int(os.getenv("RTH_MOST_ACTIVES_TOP", "50"))
 RTH_MOVERS_TOP = int(os.getenv("RTH_MOVERS_TOP", "25"))
+RTH_TOP_GAINERS_TOP = int(os.getenv("RTH_TOP_GAINERS_TOP", "30"))
+RTH_TOP_RVOL_TOP = int(os.getenv("RTH_TOP_RVOL_TOP", "40"))
+RTH_SUB10_MOMO_TOP = int(os.getenv("RTH_SUB10_MOMO_TOP", "40"))
+RTH_DISCOVERY_ACTIVE_SAMPLE = int(os.getenv("RTH_DISCOVERY_ACTIVE_SAMPLE", "500"))
 DEBUG_RTH = os.getenv("STOCK_DEBUG", os.getenv("RTH_DEBUG", "0")) == "1"
+DEBUG_MISSES = os.getenv("STOCK_DEBUG_MISSES", "0") == "1"
+DEBUG_MISS_SYMBOLS = {
+    s.strip().upper()
+    for s in (os.getenv("STOCK_DEBUG_SYMBOLS", "") or "").split(",")
+    if s.strip()
+}
 POST_NO_SIGNAL = os.getenv("STOCK_POST_NO_SIGNAL", os.getenv("RTH_POST_NO_SIGNAL", "0")) == "1"
 REJECTION_SUMMARY_LIMIT = int(os.getenv("RTH_REJECTION_SUMMARY_LIMIT", "10"))
 ALLOWED_SIGNALS = {
@@ -148,6 +159,7 @@ TIER_PROFILES = {
 }
 
 FLOAT_CANDIDATES_PATH = Path(os.getenv("RTH_FLOAT_CANDIDATES_PATH", "float_candidates.csv"))
+LOW_FLOAT_WATCHLIST_PATH = Path(os.getenv("RTH_LOW_FLOAT_WATCHLIST_PATH", str(FLOAT_CANDIDATES_PATH)))
 
 def discord(msg: str):
     if not WEBHOOK:
@@ -157,6 +169,20 @@ def discord(msg: str):
         return True
     except Exception:
         return False
+
+
+def debug_miss_enabled(symbol: str | None = None) -> bool:
+    if not DEBUG_MISSES:
+        return False
+    if symbol is None:
+        return True
+    return symbol.upper() in DEBUG_MISS_SYMBOLS
+
+
+def debug_miss(symbol: str, stage: str, detail: str):
+    if not debug_miss_enabled(symbol):
+        return
+    print(f"[MISS_DEBUG] {symbol.upper()} | {stage} | {detail}", flush=True)
 
 
 def _clean_symbols(values):
@@ -292,11 +318,105 @@ def fetch_mover_symbols():
         return []
 
 
+def fetch_gainer_symbols():
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        return []
+    params = {
+        "top": max(1, min(RTH_TOP_GAINERS_TOP, 50)),
+    }
+    try:
+        r = requests.get(MOVERS_URL, headers=alpaca_headers(), params=params, timeout=ALPACA_TIMEOUT)
+        if DEBUG_RTH:
+            discord(f"🧪 RTH debug: gainers HTTP {r.status_code} top={params['top']}")
+        r.raise_for_status()
+        payload = r.json() or {}
+        gainers = payload.get("gainers") or []
+        return _clean_symbols(str(item.get("symbol") or "") for item in gainers if isinstance(item, dict))
+    except Exception as e:
+        if DEBUG_RTH:
+            discord(f"🧪 RTH debug: gainers failed: {e}")
+        return []
+
+
 def fetch_ranked_symbols():
     ranked = _clean_symbols(fetch_most_active_symbols() + fetch_mover_symbols())
     if ranked:
         return ranked[:RTH_RANKED_POOL]
     return []
+
+
+def load_low_float_watchlist() -> list[str]:
+    if not LOW_FLOAT_WATCHLIST_PATH.exists():
+        return []
+    try:
+        with LOW_FLOAT_WATCHLIST_PATH.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            return _clean_symbols(str(row.get("symbol") or "") for row in reader)
+    except Exception as e:
+        if DEBUG_RTH:
+            discord(f"🧪 RTH debug: low-float watchlist load failed: {e}")
+        return []
+
+
+def _snapshot_metric(snapshot: dict) -> dict | None:
+    try:
+        price = float(snapshot["latestTrade"]["p"])
+        prev_close = float(snapshot["prevDailyBar"]["c"])
+        volume = float(snapshot["dailyBar"]["v"])
+        prev_volume = float(snapshot["prevDailyBar"]["v"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if price <= 0 or prev_close <= 0:
+        return None
+    pct_change = (price - prev_close) / prev_close * 100.0
+    rvol = (volume / prev_volume) if prev_volume > 0 else 0.0
+    return {
+        "price": price,
+        "pct_change": pct_change,
+        "rvol": rvol,
+        "volume": volume,
+    }
+
+
+def rank_snapshot_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
+    if not symbols or not ALPACA_KEY or not ALPACA_SECRET:
+        return [], []
+
+    metrics = []
+    chunk_size = 50
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i + chunk_size]
+        try:
+            snapshots = fetch_snapshots(chunk)
+        except Exception as e:
+            if DEBUG_RTH:
+                discord(f"🧪 RTH debug: snapshot ranking failed: {e}")
+            break
+        for sym in chunk:
+            metric = _snapshot_metric(snapshots.get(sym) or {})
+            if metric is None:
+                continue
+            metrics.append((sym, metric))
+
+    top_rvol = [
+        sym for sym, metric in sorted(
+            metrics,
+            key=lambda item: (item[1]["rvol"], item[1]["pct_change"], item[1]["volume"]),
+            reverse=True,
+        )
+        if metric["rvol"] > 1.0 and metric["pct_change"] > 0
+    ][:RTH_TOP_RVOL_TOP]
+
+    sub10_momo = [
+        sym for sym, metric in sorted(
+            metrics,
+            key=lambda item: (item[1]["pct_change"], item[1]["rvol"], item[1]["volume"]),
+            reverse=True,
+        )
+        if 0.30 <= metric["price"] <= 10.0 and metric["pct_change"] > 0
+    ][:RTH_SUB10_MOMO_TOP]
+
+    return top_rvol, sub10_momo
 
 def load_symbols():
     """
@@ -307,20 +427,77 @@ def load_symbols():
       4) .assets_cache.json with { "symbols": [...] }
       5) fallback small list
     """
+    session_cap = PREMARKET_MAX_SYMBOLS if _is_premarket_or_opening_window() else MAX_SYMBOLS
+
     # 1) explicit watchlist override
     wl = os.getenv("RTH_WATCHLIST", "").strip()
     if wl:
         syms = _clean_symbols(wl.split(","))
         if syms:
-            return syms[:MAX_SYMBOLS]
+            return syms[:session_cap]
 
-    # 2) ranked market list, then fill from active universe if needed
+    # 2) discovery sources: most active, top % gainers, snapshot-ranked RVOL, sub-$10 movers, low-float list
     if SYMBOL_SOURCE != "watchlist":
-        ranked = fetch_ranked_symbols()
         active = fetch_active_symbols()
-        syms = _clean_symbols(ranked + active)
+        most_active = fetch_most_active_symbols()
+        top_gainers = fetch_gainer_symbols()
+        low_float = load_low_float_watchlist()
+
+        discovery_pool = _clean_symbols(
+            top_gainers
+            + most_active
+            + low_float
+            + active[:max(RTH_DISCOVERY_ACTIVE_SAMPLE, session_cap)]
+        )
+        top_rvol, sub10_momo = rank_snapshot_symbols(discovery_pool)
+
+        syms = _clean_symbols(
+            top_gainers
+            + top_rvol
+            + sub10_momo
+            + low_float
+            + most_active
+            + active
+        )
+        if DEBUG_RTH:
+            discord(
+                "🧪 RTH debug: discovery "
+                f"gainers={len(top_gainers)} rvol={len(top_rvol)} "
+                f"sub10={len(sub10_momo)} low_float={len(low_float)} "
+                f"most_active={len(most_active)} active={len(active)} cap={session_cap}"
+            )
         if syms:
-            return syms[:MAX_SYMBOLS]
+            if debug_miss_enabled():
+                final_syms = syms[:session_cap]
+                discovery_sets = {
+                    "top_gainers": set(top_gainers),
+                    "top_rvol": set(top_rvol),
+                    "sub10_momo": set(sub10_momo),
+                    "low_float": set(low_float),
+                    "most_active": set(most_active),
+                    "active": set(active),
+                }
+                for symbol in sorted(DEBUG_MISS_SYMBOLS):
+                    membership = [
+                        name for name, values in discovery_sets.items()
+                        if symbol in values
+                    ]
+                    if symbol in final_syms:
+                        debug_miss(
+                            symbol,
+                            "universe",
+                            f"included final_rank={final_syms.index(symbol) + 1}/{len(final_syms)} sources={membership or ['none']}",
+                        )
+                    else:
+                        reason = "not in discovery sources"
+                        if symbol in syms:
+                            reason = f"cut by session cap rank={syms.index(symbol) + 1} cap={session_cap}"
+                        debug_miss(
+                            symbol,
+                            "universe",
+                            f"excluded reason={reason} sources={membership or ['none']}",
+                        )
+            return syms[:session_cap]
 
     # 4) assets cache fallback
     try:
@@ -328,12 +505,12 @@ def load_symbols():
             data = json.load(f)
         syms = _clean_symbols(data.get("symbols") or [])
         if syms:
-            return syms[:MAX_SYMBOLS]
+            return syms[:session_cap]
     except Exception:
         pass
 
     # 5) fallback
-    return ["AAPL", "TSLA", "NVDA", "AMD", "META"]
+    return ["AAPL", "TSLA", "NVDA", "AMD", "META"][:session_cap]
 
 def alpaca_headers():
     return {
@@ -560,7 +737,7 @@ def choose_signal_and_tier(
     reasons = []
 
     if rvol < 1.2 and pct_change > 10:
-        return "FADING", None, ["low RVOL versus extended move"]
+        return "FADING", None, ["classified FADING: low RVOL versus extended move"]
 
     if 1.5 <= rvol < 2.0 and 2.0 <= pct_change < 3.0 and volume >= 250_000:
         return "WATCH", "WATCH", []
@@ -609,7 +786,16 @@ def choose_signal_and_tier(
 
 def analyze_symbol(sym, bars_by_timeframe, snapshot):
     prefilter = evaluate_prefilter(sym, snapshot)
+    if debug_miss_enabled(sym):
+        debug_miss(
+            sym,
+            "prefilter",
+            f"price={prefilter.get('price')} volume={prefilter.get('volume')} "
+            f"vwap={prefilter.get('vwap')} vwap_distance={prefilter.get('vwap_distance')} "
+            f"passed={prefilter.get('passed')} reasons={prefilter.get('reasons') or ['none']}",
+        )
     if not prefilter["passed"]:
+        debug_miss(sym, "result", f"not_alerted prefilter_failed reasons={prefilter['reasons']}")
         return None, {
             "symbol": sym,
             "score": 0.0,
@@ -657,6 +843,15 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
     recent_high = float(primary_metrics.get("recent_high") or 0.0)
     near_high = (recent_high > 0) and (price >= recent_high * NEAR_HIGH_PCT)
     spike = float(primary_metrics.get("spike") or 0.0)
+    if debug_miss_enabled(sym):
+        debug_miss(
+            sym,
+            "metrics",
+            f"pct_change={pct:+.2f}% rvol={rvol:.2f} volume={volume} "
+            f"early_ok={early_metrics.get('ok')} early_spike={float(early_metrics.get('spike') or 0.0):.2f} "
+            f"confirmed_ok={confirmed_metrics.get('ok')} confirmed_spike={float(confirmed_metrics.get('spike') or 0.0):.2f} "
+            f"recent_high={recent_high:.4f} near_high={near_high}",
+        )
     reject_score = 0.0
     reject_score += min(max(pct, 0.0) / 12.0, 1.0) * 30.0
     reject_score += min(max(rvol, 0.0) / 3.0, 1.0) * 25.0
@@ -679,14 +874,28 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
     }
 
     if session_signal is None or tier is None:
+        debug_miss(sym, "result", f"not_alerted tier_reject reasons={fail_reasons}")
         return None, rejection
     if session_signal.upper() not in ALLOWED_SIGNALS:
         rejection["reasons"] = [f"signal {session_signal} filtered by RTH_ALLOWED_SIGNALS"]
+        debug_miss(sym, "result", f"not_alerted signal_filtered session_signal={session_signal}")
         return None, rejection
 
     catalyst = None
     if tier == "EARLY":
         catalyst = fetch_recent_8k(sym)
+
+    if debug_miss_enabled(sym):
+        debug_miss(
+            sym,
+            "classification",
+            f"session_signal={session_signal} tier={tier} near_high={near_high} "
+            f"cooldown_dedupe=not_applicable_in_rth_momentum_scanner",
+        )
+        if tier == "EXTENDED":
+            debug_miss(sym, "result", "classified EXTENDED instead of EARLY/CASINO")
+        else:
+            debug_miss(sym, "result", f"alerted tier={tier} session_signal={session_signal}")
 
     return {
         "symbol": sym,
@@ -757,6 +966,10 @@ def print_rejection_summary(rejections: list[dict]):
 
 def main():
     syms = load_symbols()
+    if debug_miss_enabled():
+        missing = sorted(symbol for symbol in DEBUG_MISS_SYMBOLS if symbol not in syms)
+        for symbol in missing:
+            debug_miss(symbol, "summary", "not evaluated because symbol was not in final universe")
     if DEBUG_RTH:
         discord(
             "🧪 RTH scanner run: "

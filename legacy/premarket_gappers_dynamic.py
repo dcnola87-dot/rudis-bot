@@ -102,22 +102,36 @@ def load_json(path: Path, default):
 def save_json(path: Path, obj):
     path.write_text(json.dumps(obj))
 
+def _cache_template() -> Dict:
+    return {"watch": {}, "full": {}, "_day": ""}
+
+def _fast_memo_template() -> Dict:
+    return {"last": {}, "_day": ""}
+
 def load_cache() -> Dict:
-    return load_json(CACHE_PATH, {"watch": {}, "full": {}, "_day": ""})
+    return load_json(CACHE_PATH, _cache_template())
 
 def save_cache(cache: Dict) -> None:
     save_json(CACHE_PATH, cache)
 
 def load_fast_memo() -> Dict:
-    return load_json(FAST_DEDUPE, {"last": {}, "_day": ""})
+    return load_json(FAST_DEDUPE, _fast_memo_template())
 
 def save_fast_memo(m: Dict) -> None:
     save_json(FAST_DEDUPE, m)
 
-def reset_day_dict(d: Dict, today: str) -> Dict:
+def reset_day_dict(d: Dict, today: str, template: Dict) -> Dict:
+    base = {
+        k: (v.copy() if isinstance(v, dict) else v)
+        for k, v in template.items()
+    }
     if d.get("_day") != today:
-        d.clear()
-        d["_day"] = today
+        base["_day"] = today
+        return base
+    for k, v in base.items():
+        if k == "_day":
+            continue
+        d.setdefault(k, v.copy() if isinstance(v, dict) else v)
     return d
 
 def now_et() -> datetime:
@@ -413,8 +427,8 @@ def main_once():
     cache = load_cache()
     fast = load_fast_memo()
     today = datetime.now(CT).strftime("%Y-%m-%d")
-    cache = reset_day_dict(cache, today)
-    fast  = reset_day_dict(fast, today)
+    cache = reset_day_dict(cache, today, _cache_template())
+    fast  = reset_day_dict(fast, today, _fast_memo_template())
 
     watch, full, mode, _ = scan_once()
     if mode is None:
