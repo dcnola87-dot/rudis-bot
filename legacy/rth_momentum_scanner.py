@@ -47,6 +47,7 @@ RTH_TOP_GAINERS_TOP = int(os.getenv("RTH_TOP_GAINERS_TOP", "30"))
 RTH_TOP_RVOL_TOP = int(os.getenv("RTH_TOP_RVOL_TOP", "40"))
 RTH_SUB10_MOMO_TOP = int(os.getenv("RTH_SUB10_MOMO_TOP", "40"))
 RTH_DISCOVERY_ACTIVE_SAMPLE = int(os.getenv("RTH_DISCOVERY_ACTIVE_SAMPLE", "500"))
+OPENING_FALLBACK_MINUTES = int(os.getenv("RTH_OPENING_FALLBACK_MINUTES", "20"))
 DEBUG_RTH = os.getenv("STOCK_DEBUG", os.getenv("RTH_DEBUG", "0")) == "1"
 DEBUG_MISSES = os.getenv("STOCK_DEBUG_MISSES", "0") == "1"
 DEBUG_MISS_SYMBOLS = {
@@ -418,6 +419,42 @@ def rank_snapshot_symbols(symbols: list[str]) -> tuple[list[str], list[str]]:
 
     return top_rvol, sub10_momo
 
+
+def rank_priority_symbols(symbols: list[str]) -> list[str]:
+    if not symbols or not ALPACA_KEY or not ALPACA_SECRET:
+        return []
+
+    metrics = []
+    chunk_size = 50
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i + chunk_size]
+        try:
+            snapshots = fetch_snapshots(chunk)
+        except Exception as e:
+            if DEBUG_RTH:
+                discord(f"🧪 RTH debug: priority ranking failed: {e}")
+            break
+        for sym in chunk:
+            metric = _snapshot_metric(snapshots.get(sym) or {})
+            if metric is None:
+                continue
+            score = 0.0
+            score += min(max(metric["pct_change"], 0.0), 60.0) * 2.0
+            score += min(max(metric["rvol"], 0.0), 25.0) * 8.0
+            score += min(metric["volume"] / 250_000.0, 20.0) * 3.0
+            if 0.30 <= metric["price"] <= 10.0:
+                score += 80.0
+            if sym in FLOAT_CANDIDATES:
+                score += 60.0
+            metrics.append((sym, score, metric))
+
+    ranked = sorted(
+        metrics,
+        key=lambda item: (item[1], item[2]["rvol"], item[2]["pct_change"], item[2]["volume"]),
+        reverse=True,
+    )
+    return [sym for sym, _, _ in ranked]
+
 def load_symbols():
     """
     Tries, in priority order:
@@ -449,10 +486,12 @@ def load_symbols():
             + low_float
             + active[:max(RTH_DISCOVERY_ACTIVE_SAMPLE, session_cap)]
         )
+        priority = rank_priority_symbols(discovery_pool)
         top_rvol, sub10_momo = rank_snapshot_symbols(discovery_pool)
 
         syms = _clean_symbols(
-            top_gainers
+            priority
+            + top_gainers
             + top_rvol
             + sub10_momo
             + low_float
@@ -462,7 +501,7 @@ def load_symbols():
         if DEBUG_RTH:
             discord(
                 "🧪 RTH debug: discovery "
-                f"gainers={len(top_gainers)} rvol={len(top_rvol)} "
+                f"priority={len(priority)} gainers={len(top_gainers)} rvol={len(top_rvol)} "
                 f"sub10={len(sub10_momo)} low_float={len(low_float)} "
                 f"most_active={len(most_active)} active={len(active)} cap={session_cap}"
             )
@@ -470,6 +509,7 @@ def load_symbols():
             if debug_miss_enabled():
                 final_syms = syms[:session_cap]
                 discovery_sets = {
+                    "priority": set(priority),
                     "top_gainers": set(top_gainers),
                     "top_rvol": set(top_rvol),
                     "sub10_momo": set(sub10_momo),
@@ -725,6 +765,34 @@ def _is_premarket_or_opening_window() -> bool:
     return now.hour == 9 and now.minute < 45
 
 
+def _is_opening_fallback_window() -> bool:
+    now = datetime.now(ET)
+    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
+        return True
+    open_minutes = (now.hour * 60 + now.minute) - (9 * 60 + 30)
+    return 0 <= open_minutes < OPENING_FALLBACK_MINUTES
+
+
+def opening_fallback_metrics(price: float, volume: int, pct_change: float, rvol: float, vwap: float) -> dict:
+    recent_high = max(price, vwap) if vwap > 0 else price
+    approx_spike = max(rvol, 0.0)
+    if volume >= 1_000_000:
+        approx_spike = max(approx_spike, 2.0)
+    elif volume >= 500_000:
+        approx_spike = max(approx_spike, 1.5)
+    elif volume >= 250_000:
+        approx_spike = max(approx_spike, 1.2)
+    return {
+        "ok": True,
+        "current_bar_volume": float(volume),
+        "avg_bar_volume": max(float(volume) / max(approx_spike, 1.0), 1.0),
+        "spike": approx_spike,
+        "recent_high": recent_high,
+        "fallback": True,
+        "reasons": [f"opening fallback metrics used pct={pct_change:+.1f}% rvol={rvol:.1f}x"],
+    }
+
+
 def choose_signal_and_tier(
     price: float,
     pct_change: float,
@@ -735,6 +803,7 @@ def choose_signal_and_tier(
     is_float_candidate: bool,
 ) -> tuple[str | None, str | None, list[str]]:
     reasons = []
+    opening_fallback = _is_opening_fallback_window()
 
     if rvol < 1.2 and pct_change > 10:
         return "FADING", None, ["classified FADING: low RVOL versus extended move"]
@@ -761,7 +830,13 @@ def choose_signal_and_tier(
             tier_reasons.append(f"pct move {pct_change:+.1f}% < {tier['min_pct']:.1f}%")
         max_pct = tier.get("max_pct")
         if max_pct is not None and pct_change > max_pct:
-            tier_reasons.append(f"pct move {pct_change:+.1f}% > {max_pct:.1f}% anti-chase")
+            if not (
+                opening_fallback
+                and tier_name in {"EARLY", "CASINO"}
+                and rvol >= 3.0
+                and volume >= 500_000
+            ):
+                tier_reasons.append(f"pct move {pct_change:+.1f}% > {max_pct:.1f}% anti-chase")
         spike = float(metrics.get("spike") or 0.0)
         if spike < tier["min_spike"]:
             tier_reasons.append(f"bar spike {spike:.1f}x < {tier['min_spike']:.1f}x")
@@ -771,6 +846,11 @@ def choose_signal_and_tier(
             tier_reasons.append(f"too far below VWAP ({(vwap - price) / vwap:.1%})")
         if tier_name == "CASINO" and not is_float_candidate and price > 8.0:
             tier_reasons.append("casino profile reserved for sub-$8 squeezes")
+
+        if opening_fallback and tier_name in {"EARLY", "CASINO"}:
+            tier_reasons = [reason for reason in tier_reasons if "not enough bars" not in reason]
+            if volume >= 500_000 and rvol >= max(tier["min_rvol"], 2.5):
+                tier_reasons = [reason for reason in tier_reasons if not reason.startswith("bar spike ")]
 
         if not tier_reasons:
             session_signal = "CONFIRMED" if tier_name in {"CONFIRMED", "EXTENDED"} else tier_name
@@ -818,6 +898,8 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
             "reasons": ["snapshot fields missing during analysis"],
         }
 
+    pct = (price - prev_close) / prev_close * 100 if prev_close else 0
+    rvol = (volume / prev_day_volume) if prev_day_volume > 0 else 0.0
     metrics_by_timeframe = {}
     for timeframe, lookback in (
         (EARLY_TIMEFRAME, EARLY_LOOKBACK_BARS),
@@ -825,9 +907,23 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
     ):
         bars = bars_by_timeframe.get(timeframe) or []
         metrics_by_timeframe[timeframe] = evaluate_bar_metrics(bars, lookback)
-
-    pct = (price - prev_close) / prev_close * 100 if prev_close else 0
-    rvol = (volume / prev_day_volume) if prev_day_volume > 0 else float((metrics_by_timeframe.get(EARLY_TIMEFRAME) or {}).get("spike") or 0.0)
+        if (
+            _is_opening_fallback_window()
+            and timeframe == EARLY_TIMEFRAME
+            and not metrics_by_timeframe[timeframe].get("ok")
+            and volume >= 250_000
+            and pct > 0
+            and rvol >= 1.5
+        ):
+            metrics_by_timeframe[timeframe] = opening_fallback_metrics(
+                price=price,
+                volume=volume,
+                pct_change=pct,
+                rvol=rvol,
+                vwap=vwap,
+            )
+    if prev_day_volume <= 0:
+        rvol = float((metrics_by_timeframe.get(EARLY_TIMEFRAME) or {}).get("spike") or 0.0)
     session_signal, tier, fail_reasons = choose_signal_and_tier(
         price=price,
         pct_change=pct,
