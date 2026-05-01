@@ -27,9 +27,12 @@ EDGAR_SEARCH_URL = os.getenv("SEC_EDGAR_SEARCH_URL", "https://efts.sec.gov/LATES
 DATA_BASE = os.getenv("ALPACA_DATA_BARS_URL", "https://data.alpaca.markets/v2/stocks/bars")
 ALPACA_FEED = os.getenv("ALPACA_FEED", "iex")
 ALPACA_TIMEOUT = int(os.getenv("ALPACA_TIMEOUT", "20"))
+ALPACA_REQUEST_RETRIES = int(os.getenv("ALPACA_REQUEST_RETRIES", "2"))
+ALPACA_RETRY_SLEEP_SEC = float(os.getenv("ALPACA_RETRY_SLEEP_SEC", "1.5"))
 ASSETS_CACHE_PATH = Path(os.getenv("RTH_ASSETS_CACHE_PATH", ".assets_cache.json"))
 SIGNAL_CACHE_PATH = Path(os.getenv("RTH_SIGNAL_CACHE_PATH", ".rth_signal_cache.json"))
 SIGNAL_LOG_PATH = Path(os.getenv("RTH_SIGNAL_LOG_PATH", "logs/stock_signal_calls.jsonl"))
+ERROR_CACHE_PATH = Path(os.getenv("RTH_ERROR_CACHE_PATH", ".rth_error_cache.json"))
 SYMBOL_SOURCE = os.getenv("RTH_SYMBOL_SOURCE", "dynamic").strip().lower()
 
 # ---- Tunables (RTH params) ----
@@ -62,6 +65,8 @@ DEBUG_MISS_SYMBOLS = {
 }
 POST_NO_SIGNAL = os.getenv("STOCK_POST_NO_SIGNAL", os.getenv("RTH_POST_NO_SIGNAL", "0")) == "1"
 REJECTION_SUMMARY_LIMIT = int(os.getenv("RTH_REJECTION_SUMMARY_LIMIT", "10"))
+RTH_CHUNK_SIZE = int(os.getenv("RTH_CHUNK_SIZE", "25"))
+ERROR_ALERT_COOLDOWN_SEC = int(os.getenv("RTH_ERROR_ALERT_COOLDOWN_SEC", "900"))
 ALLOWED_SIGNALS = {
     s.strip().upper()
     for s in (os.getenv("RTH_ALLOWED_SIGNALS", "WATCH,EARLY,CONFIRMED,EXTENDED,FADING") or "").split(",")
@@ -213,6 +218,64 @@ def save_signal_cache(cache: dict):
         SIGNAL_CACHE_PATH.write_text(json.dumps(cache))
     except Exception:
         pass
+
+
+def load_error_cache() -> dict:
+    if ERROR_CACHE_PATH.exists():
+        try:
+            raw = json.loads(ERROR_CACHE_PATH.read_text())
+            if isinstance(raw, dict):
+                raw.setdefault("errors", {})
+                return raw
+        except Exception:
+            pass
+    return {"errors": {}}
+
+
+def save_error_cache(cache: dict):
+    try:
+        ERROR_CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+
+def _shorten_text(value: str, limit: int = 220) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def summarize_request_exception(exc: Exception) -> str:
+    if isinstance(exc, requests.Timeout):
+        return f"timeout after {ALPACA_TIMEOUT}s"
+    if isinstance(exc, requests.ConnectionError):
+        return "connection error"
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        if response is not None:
+            return f"HTTP {response.status_code}"
+        return "HTTP error"
+    return _shorten_text(str(exc), limit=120) or exc.__class__.__name__
+
+
+def notify_scanner_error(scope: str, exc: Exception, *, details: str = ""):
+    summary = summarize_request_exception(exc)
+    key = f"{scope}|{summary}|{details}"
+    now_ts = time.time()
+    cache = load_error_cache()
+    last_ts = float((cache.get("errors") or {}).get(key) or 0.0)
+    if last_ts and now_ts - last_ts < ERROR_ALERT_COOLDOWN_SEC:
+        print(f"[RTH_ERROR_SUPPRESSED] {scope}: {summary} {details}".strip(), flush=True)
+        return
+
+    cache.setdefault("errors", {})
+    cache["errors"][key] = now_ts
+    save_error_cache(cache)
+
+    suffix = f" | {details}" if details else ""
+    discord(f"⚠️ RTH scanner {scope}: {summary}{suffix}")
+    print(f"[RTH_ERROR] {scope}: {exc} {details}".strip(), flush=True)
 
 
 def append_signal_log(sig: dict):
@@ -698,24 +761,12 @@ def fetch_bars(symbols, timeframe: str, lookback_bars: int):
         "feed": ALPACA_FEED,
     }
 
-    r = requests.get(DATA_BASE, headers=alpaca_headers(), params=params, timeout=ALPACA_TIMEOUT)
-    if DEBUG_RTH:
-        discord(f"🧪 RTH debug: bars HTTP {r.status_code} (symbols={len(symbols)}) feed={ALPACA_FEED}")
-
-    # Alpaca will return 403 if the key is invalid for market data, the plan/feed is not permitted,
-    # or the request is otherwise forbidden. Surface a helpful message.
-    if r.status_code == 403:
-        snippet = (r.text or "").strip()
-        if len(snippet) > 280:
-            snippet = snippet[:280] + "…"
-        raise RuntimeError(
-            "403 Forbidden from Alpaca data API. "
-            "Check that ALPACA_KEY/ALPACA_SECRET are correct for your account, "
-            "and that your account has permission for the selected feed (ALPACA_FEED=iex|sip). "
-            f"URL={r.url} Response={snippet}"
-        )
-
-    r.raise_for_status()
+    r = alpaca_get(
+        DATA_BASE,
+        params=params,
+        request_name=f"bars {timeframe}",
+        symbol_count=len(symbols),
+    )
     return r.json().get("bars", {})  # dict: { "AAPL": [ {o,h,l,c,v,t...}, ...], ... }
 
 
@@ -727,22 +778,12 @@ def fetch_snapshots(symbols):
         "symbols": ",".join(symbols),
         "feed": ALPACA_FEED,
     }
-    r = requests.get(SNAPSHOTS_URL, headers=alpaca_headers(), params=params, timeout=ALPACA_TIMEOUT)
-    if DEBUG_RTH:
-        discord(f"🧪 RTH debug: snapshots HTTP {r.status_code} (symbols={len(symbols)}) feed={ALPACA_FEED}")
-
-    if r.status_code == 403:
-        snippet = (r.text or "").strip()
-        if len(snippet) > 280:
-            snippet = snippet[:280] + "…"
-        raise RuntimeError(
-            "403 Forbidden from Alpaca snapshots API. "
-            "Check that ALPACA_KEY/ALPACA_SECRET are correct for your account, "
-            "and that your account has permission for the selected feed (ALPACA_FEED=iex|sip). "
-            f"URL={r.url} Response={snippet}"
-        )
-
-    r.raise_for_status()
+    r = alpaca_get(
+        SNAPSHOTS_URL,
+        params=params,
+        request_name="snapshots",
+        symbol_count=len(symbols),
+    )
     return r.json() or {}
 
 
@@ -1259,10 +1300,59 @@ def print_rejection_summary(rejections: list[dict]):
         reason_text = "; ".join(item["reasons"][:3])
         print(f" - {item['symbol']}: {', '.join(parts)} -> {reason_text}")
 
+
+def alpaca_get(url: str, *, params: dict, request_name: str, symbol_count: int):
+    attempts = max(1, ALPACA_REQUEST_RETRIES + 1)
+    last_exc = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, headers=alpaca_headers(), params=params, timeout=ALPACA_TIMEOUT)
+            if DEBUG_RTH:
+                discord(
+                    f"🧪 RTH debug: {request_name} HTTP {response.status_code} "
+                    f"(symbols={symbol_count}) feed={ALPACA_FEED} attempt={attempt}/{attempts}"
+                )
+
+            if response.status_code == 403:
+                snippet = _shorten_text(response.text or "", limit=160)
+                raise RuntimeError(
+                    f"{request_name} forbidden (HTTP 403). "
+                    "Check ALPACA_KEY/ALPACA_SECRET and market-data permission for "
+                    f"ALPACA_FEED={ALPACA_FEED}. Response={snippet}"
+                )
+
+            response.raise_for_status()
+            return response
+        except RuntimeError:
+            raise
+        except requests.Timeout as exc:
+            last_exc = exc
+        except requests.ConnectionError as exc:
+            last_exc = exc
+        except requests.HTTPError as exc:
+            last_exc = exc
+            break
+
+        if attempt < attempts:
+            time.sleep(ALPACA_RETRY_SLEEP_SEC * attempt)
+
+    if last_exc is not None:
+        raise RuntimeError(
+            f"{request_name} failed after {attempts} attempts "
+            f"(symbols={symbol_count}, feed={ALPACA_FEED}): {summarize_request_exception(last_exc)}"
+        ) from last_exc
+    raise RuntimeError(
+        f"{request_name} failed after {attempts} attempts "
+        f"(symbols={symbol_count}, feed={ALPACA_FEED})"
+    )
+
 def main():
     syms = load_symbols()
     signal_cache = reset_signal_cache(load_signal_cache())
     now_ts = time.time()
+    chunk_failures = 0
+    chunk_successes = 0
     if debug_miss_enabled():
         missing = sorted(symbol for symbol in DEBUG_MISS_SYMBOLS if symbol not in syms)
         for symbol in missing:
@@ -1276,7 +1366,7 @@ def main():
             f"symbols={len(syms)} feed={os.getenv('ALPACA_FEED','iex')}"
         )
     # Chunk symbols to avoid big query strings / rate limits
-    CHUNK = 50
+    CHUNK = max(1, RTH_CHUNK_SIZE)
     hits = 0
     rejections = []
 
@@ -1285,15 +1375,27 @@ def main():
         try:
             snapshots = fetch_snapshots(chunk)
         except Exception as e:
-            discord(f"⚠️ RTH scanner error: {e}")
-            return
+            chunk_failures += 1
+            notify_scanner_error(
+                "snapshot fetch failed",
+                e,
+                details=f"chunk={i // CHUNK + 1} size={len(chunk)} feed={ALPACA_FEED}",
+            )
+            continue
 
         try:
             early_bars_map = fetch_bars(chunk, EARLY_TIMEFRAME, EARLY_LOOKBACK_BARS)
             confirmed_bars_map = fetch_bars(chunk, CONFIRMED_TIMEFRAME, CONFIRMED_LOOKBACK_BARS)
         except Exception as e:
-            discord(f"⚠️ RTH scanner error: {e}")
-            return
+            chunk_failures += 1
+            notify_scanner_error(
+                "bars fetch failed",
+                e,
+                details=f"chunk={i // CHUNK + 1} size={len(chunk)} feed={ALPACA_FEED}",
+            )
+            continue
+
+        chunk_successes += 1
 
         for sym in chunk:
             sig, rejection = analyze_symbol(
@@ -1323,8 +1425,14 @@ def main():
     save_signal_cache(signal_cache)
     print_rejection_summary(rejections)
 
-    if hits == 0 and (POST_NO_SIGNAL or DEBUG_RTH):
+    if hits == 0 and chunk_successes > 0 and (POST_NO_SIGNAL or DEBUG_RTH):
         discord("ℹ️ RTH scanner: no signals this run.")
+
+    if chunk_failures and DEBUG_RTH:
+        discord(
+            f"🧪 RTH scanner chunk summary: ok={chunk_successes} failed={chunk_failures} "
+            f"chunk_size={CHUNK} retries={ALPACA_REQUEST_RETRIES}"
+        )
 
     if DEBUG_RTH:
         discord(f"🧪 RTH scanner finished. hits={hits}")
