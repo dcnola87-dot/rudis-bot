@@ -17,6 +17,8 @@ ALPACA_FEED = os.getenv("ALPACA_FEED", "iex")
 ALPACA_TIMEOUT = int(os.getenv("ALPACA_TIMEOUT", "20"))
 DATA_BASE = os.getenv("ALPACA_DATA_BARS_URL", "https://data.alpaca.markets/v2/stocks/bars")
 SIGNAL_LOG_PATH = Path(os.getenv("RTH_SIGNAL_LOG_PATH", "logs/stock_signal_calls.jsonl"))
+GRADE_WEBHOOK = os.getenv("RTH_GRADE_WEBHOOK", os.getenv("STOCKS_WEBHOOK", ""))
+POST_DISCORD = os.getenv("RTH_GRADE_POST_DISCORD", "0") == "1"
 
 
 def alpaca_headers():
@@ -209,6 +211,54 @@ def print_report(results: list[dict], target_date: str):
         )
 
 
+def build_discord_report(results: list[dict], target_date: str) -> str:
+    by_tier = defaultdict(list)
+    for row in results:
+        by_tier[str(row.get("tier") or "UNKNOWN").upper()].append(row)
+
+    lines = [
+        f"📘 **Stock EOD Report** `{target_date}`",
+        f"Signals graded: **{len(results)}**",
+        "",
+        "**By Tier**",
+    ]
+    for tier in sorted(by_tier):
+        rows = by_tier[tier]
+        good = sum(1 for row in rows if row.get("grade") == "good")
+        avg_max = sum((row.get("max_return_pct") or 0.0) for row in rows) / max(len(rows), 1)
+        avg_close = sum((row.get("return_close_pct") or 0.0) for row in rows) / max(len(rows), 1)
+        lines.append(
+            f"- `{tier}` count={len(rows)} good={good} avg_max={avg_max:+.1f}% avg_close={avg_close:+.1f}%"
+        )
+
+    best = sorted(results, key=lambda row: row.get("max_return_pct") or -9999, reverse=True)[:5]
+    worst = sorted(results, key=lambda row: row.get("min_return_pct") or 9999)[:5]
+
+    lines.append("")
+    lines.append("**Best Calls**")
+    for row in best:
+        lines.append(
+            f"- `{row['symbol']}` {row['tier']} max={fmt_pct(row.get('max_return_pct'))} "
+            f"close={fmt_pct(row.get('return_close_pct'))} grade={row['grade']}"
+        )
+
+    lines.append("")
+    lines.append("**Worst Drawdowns**")
+    for row in worst:
+        lines.append(
+            f"- `{row['symbol']}` {row['tier']} min={fmt_pct(row.get('min_return_pct'))} "
+            f"close={fmt_pct(row.get('return_close_pct'))} grade={row['grade']}"
+        )
+
+    return "\n".join(lines)
+
+
+def post_discord_report(report_text: str):
+    if not POST_DISCORD or not GRADE_WEBHOOK:
+        return
+    requests.post(GRADE_WEBHOOK, json={"content": report_text[:1900]}, timeout=15)
+
+
 def main():
     target_date = resolve_target_date()
     rows = load_signal_rows(target_date)
@@ -217,6 +267,7 @@ def main():
         return
     results = [grade_signal(row) for row in rows]
     print_report(results, target_date)
+    post_discord_report(build_discord_report(results, target_date))
 
 
 if __name__ == "__main__":
