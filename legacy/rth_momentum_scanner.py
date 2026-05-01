@@ -791,12 +791,24 @@ def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
         price = float(snapshot["latestTrade"]["p"])
         volume = int(snapshot["dailyBar"]["v"])
         vwap = float(snapshot["dailyBar"]["vw"])
+        prev_close = float(snapshot["prevDailyBar"]["c"])
+        prev_volume = float(snapshot["prevDailyBar"]["v"])
         vwap_distance = abs(price - vwap) / vwap if vwap > 0 else math.inf
+        pct_change = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
+        rvol = (volume / prev_volume) if prev_volume > 0 else 0.0
         reasons = []
+
+        opening_microcap_exception = (
+            _is_rth_opening_window()
+            and 0.30 <= price <= 2.0
+            and volume >= 40_000
+            and pct_change >= 8.0
+            and rvol >= 1.5
+        )
 
         if not (0.30 <= price <= 25.00):
             reasons.append(f"price {price:.2f} outside 0.30-25.00")
-        if volume < 250_000:
+        if volume < 250_000 and not opening_microcap_exception:
             reasons.append(f"volume {volume:,} < 250,000")
         if vwap <= 0:
             reasons.append("VWAP missing")
@@ -810,6 +822,8 @@ def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
                 "volume": volume,
                 "vwap": vwap,
                 "vwap_distance": vwap_distance,
+                "pct_change": pct_change,
+                "rvol": rvol,
             }
         if FLOAT_CANDIDATES:
             if DEBUG_RTH:
@@ -823,6 +837,8 @@ def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
             "volume": volume,
             "vwap": vwap,
             "vwap_distance": vwap_distance,
+            "pct_change": pct_change,
+            "rvol": rvol,
         }
     except (KeyError, TypeError, ValueError):
         if DEBUG_RTH:
@@ -920,6 +936,12 @@ def _is_opening_fallback_window() -> bool:
     return 0 <= open_minutes < OPENING_FALLBACK_MINUTES
 
 
+def _is_rth_opening_window() -> bool:
+    now = datetime.now(ET)
+    open_minutes = (now.hour * 60 + now.minute) - (9 * 60 + 30)
+    return 0 <= open_minutes < OPENING_FALLBACK_MINUTES
+
+
 def opening_fallback_metrics(price: float, volume: int, pct_change: float, rvol: float, vwap: float) -> dict:
     recent_high = max(price, vwap) if vwap > 0 else price
     approx_spike = max(rvol, 0.0)
@@ -951,6 +973,7 @@ def choose_signal_and_tier(
 ) -> tuple[str | None, str | None, list[str]]:
     reasons = []
     opening_fallback = _is_opening_fallback_window()
+    rth_opening = _is_rth_opening_window()
     rvol_thresholds = session_rvol_thresholds()
 
     if rvol < 1.2 and pct_change > 10:
@@ -975,12 +998,19 @@ def choose_signal_and_tier(
         min_rvol = tier["min_rvol"]
         if tier_name == "EARLY":
             min_rvol = rvol_thresholds["early"]
+            if rth_opening:
+                min_rvol = max(1.7, min_rvol - 0.3)
         elif tier_name == "CONFIRMED":
             min_rvol = rvol_thresholds["confirmed"]
+            if rth_opening:
+                min_rvol = max(2.2, min_rvol - 0.3)
         if rvol < min_rvol:
             tier_reasons.append(f"RVOL {rvol:.1f}x < {min_rvol:.1f}x")
-        if pct_change < tier["min_pct"]:
-            tier_reasons.append(f"pct move {pct_change:+.1f}% < {tier['min_pct']:.1f}%")
+        min_pct = tier["min_pct"]
+        if tier_name == "EARLY" and rth_opening:
+            min_pct = 3.0
+        if pct_change < min_pct:
+            tier_reasons.append(f"pct move {pct_change:+.1f}% < {min_pct:.1f}%")
         max_pct = tier.get("max_pct")
         if max_pct is not None and pct_change > max_pct:
             if not (
@@ -1000,18 +1030,26 @@ def choose_signal_and_tier(
             tier_reasons.append(f"bar spike {spike:.1f}x < {min_spike:.1f}x")
         if tier["require_vwap_hold"] and price < vwap:
             tier_reasons.append(f"below VWAP by {(vwap - price) / vwap:.1%}")
-        if tier_name == "EARLY" and vwap > 0 and price < vwap * 0.98:
-            tier_reasons.append(f"too far below VWAP ({(vwap - price) / vwap:.1%})")
+        if tier_name == "EARLY" and vwap > 0:
+            min_vwap_hold = 0.98 if not rth_opening else 0.975
+            if price < vwap * min_vwap_hold:
+                tier_reasons.append(f"too far below VWAP ({(vwap - price) / vwap:.1%})")
         if tier_name == "EARLY":
             recent_high = float(metrics.get("recent_high") or 0.0)
-            if recent_high > 0 and price < recent_high * 0.985:
+            near_high_floor = 0.985 if not rth_opening else 0.975
+            if recent_high > 0 and price < recent_high * near_high_floor:
                 tier_reasons.append(f"not close enough to highs ({price / recent_high:.1%} of recent high)")
         if tier_name == "CASINO" and not is_float_candidate and price > 8.0:
             tier_reasons.append("casino profile reserved for sub-$8 squeezes")
 
         if opening_fallback and tier_name in {"EARLY", "CASINO"}:
             tier_reasons = [reason for reason in tier_reasons if "not enough bars" not in reason]
-            if volume >= 750_000 and rvol >= max(tier["min_rvol"], 3.0):
+            fallback_rvol_gate = max(tier["min_rvol"], 3.0)
+            fallback_vol_gate = 750_000
+            if rth_opening:
+                fallback_rvol_gate = max(tier["min_rvol"] - 0.5, 2.0)
+                fallback_vol_gate = 400_000 if tier_name == "CASINO" else 600_000
+            if volume >= fallback_vol_gate and rvol >= fallback_rvol_gate:
                 tier_reasons = [reason for reason in tier_reasons if not reason.startswith("bar spike ")]
 
         if not tier_reasons:
