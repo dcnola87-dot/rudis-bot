@@ -1348,6 +1348,11 @@ def alpaca_get(url: str, *, params: dict, request_name: str, symbol_count: int):
     )
 
 def main():
+    if datetime.now(ET).weekday() >= 5:
+        if DEBUG_RTH:
+            discord("🧪 RTH scanner skipped: weekend.")
+        return
+
     syms = load_symbols()
     signal_cache = reset_signal_cache(load_signal_cache())
     now_ts = time.time()

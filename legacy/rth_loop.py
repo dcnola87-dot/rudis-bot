@@ -22,7 +22,13 @@ def discord(msg: str):
     except Exception:
         pass
 
+def is_trading_weekday(ts: datetime) -> bool:
+    return ts.weekday() < 5
+
 def current_session(ts: datetime) -> str | None:
+    if not is_trading_weekday(ts):
+        return None
+
     mins = ts.hour * 60 + ts.minute
     premarket_start = 3 * 60
     rth_start = 8 * 60 + 30
@@ -77,7 +83,7 @@ while True:
         subprocess.run([sys.executable, "rth_momentum_scanner.py"], env=env)
         time.sleep(scan_interval_seconds(now, session))
     else:
-        if EOD_REPORT_ENABLED:
+        if EOD_REPORT_ENABLED and is_trading_weekday(now):
             report_time_reached = (
                 now.hour > EOD_REPORT_HOUR
                 or (now.hour == EOD_REPORT_HOUR and now.minute >= EOD_REPORT_MINUTE)
