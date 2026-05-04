@@ -136,7 +136,7 @@ TIER_PROFILES = {
         "max_pct": None,
         "timeframe": EARLY_TIMEFRAME,
         "lookback_bars": EARLY_LOOKBACK_BARS,
-        "require_vwap_hold": False,
+        "require_vwap_hold": True,
         "tagline": "Late extension / do not chase",
     },
     "CASINO": {
@@ -151,7 +151,7 @@ TIER_PROFILES = {
         "max_pct": None,
         "timeframe": EARLY_TIMEFRAME,
         "lookback_bars": EARLY_LOOKBACK_BARS,
-        "require_vwap_hold": False,
+        "require_vwap_hold": True,
         "tagline": "Low Float Squeeze",
     },
     "EARLY": {
