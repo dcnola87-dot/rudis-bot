@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent
 CACHE_PATH      = ROOT / ".posted_cache_dynamic.json"
 FAST_DEDUPE     = ROOT / ".fast_recent_posts.json"     # short cooldown memory
 LOG_FILE        = ROOT / "logs" / "scanner.log"
+SIGNAL_LOG_PATH = ROOT / "logs" / "stock_signal_calls.jsonl"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # ── Fast-mode knobs (edit via .env if you like) ──
@@ -43,6 +44,8 @@ SLOW_BATCH          = 200
 MAX_SYMBOLS = 4000
 PRICE_MIN = 0.40
 PRICE_MAX = 40.00
+PREV_CLOSE_PRICE_MIN = 0.50
+PREV_CLOSE_PRICE_MAX = 5.00
 TOP_N = 12
 API_POST_SLEEP_S = 0.25
 BULLISH_ONLY = True
@@ -82,6 +85,19 @@ def log(s: str):
     try:
         with LOG_FILE.open("a") as f:
             f.write(line + "\n")
+    except Exception:
+        pass
+
+def append_signal_log(payload: dict) -> None:
+    row = {
+        "logged_at_utc": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "logged_at_et": datetime.now(ET).isoformat(),
+        **payload,
+    }
+    try:
+        SIGNAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with SIGNAL_LOG_PATH.open("a") as f:
+            f.write(json.dumps(row) + "\n")
     except Exception:
         pass
 
@@ -179,6 +195,49 @@ def yahoo_1m(symbols: List[str], start_et: datetime, end_et: datetime) -> pd.Dat
     df = pd.concat(out, ignore_index=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(ET)
     return df
+
+
+def previous_closes(symbols: List[str]) -> Dict[str, float]:
+    closes: Dict[str, float] = {}
+    if not symbols:
+        return closes
+
+    try:
+        raw = yf.download(
+            tickers=[clean_sym(sym) for sym in symbols],
+            period="5d",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception as e:
+        log(f"prev close fetch err: {e}")
+        return closes
+
+    if raw is None or raw.empty:
+        return closes
+
+    # yfinance returns a flat frame for a single symbol and a multi-index frame for many.
+    if len(symbols) == 1:
+        sym = symbols[0]
+        try:
+            series = raw["Close"].dropna()
+            if len(series) >= 2:
+                closes[sym] = float(series.iloc[-2])
+        except Exception:
+            pass
+        return closes
+
+    for sym in symbols:
+        try:
+            series = raw[clean_sym(sym)]["Close"].dropna()
+            if len(series) >= 2:
+                closes[sym] = float(series.iloc[-2])
+        except Exception:
+            continue
+    return closes
 
 # ───────────────── Alpaca 1m (RTH) ─────────────────
 def alpaca_bars_1m(symbols: List[str], start_et: datetime, end_et: datetime) -> pd.DataFrame:
@@ -308,7 +367,31 @@ def post_watch(sym: str, gap_pct: float, vol: int, last_px: float, mom_pct: floa
         f"Momentum (3m): {mom_pct:.1f}%{badge_txt}\n"
         f"_Uptrend forming; will post **FULL PLAY** if confirmation hits._"
     )
-    post(msg); time.sleep(API_POST_SLEEP_S)
+    post(msg)
+    append_signal_log(
+        {
+            "source": "premarket_gappers_dynamic",
+            "mode": mode,
+            "symbol": sym,
+            "session_signal": "WATCH",
+            "tier": "EARLY_WATCH",
+            "price": last_px,
+            "pct_change": gap_pct,
+            "rvol": None,
+            "volume": vol,
+            "spike": mom_pct,
+            "spike_1m": None,
+            "spike_5m": None,
+            "vwap": None,
+            "vwap_distance": None,
+            "recent_high": None,
+            "near_high": None,
+            "is_float_candidate": bool(flt),
+            "filing_type": None,
+            "dollar_volume": dollarv,
+        }
+    )
+    time.sleep(API_POST_SLEEP_S)
 
 def post_full(sym: str, gap_pct: float, vol: int, last_px: float, mom_pct: float,
               dollarv: float, mode: str, ref_px: float):
@@ -321,7 +404,31 @@ def post_full(sym: str, gap_pct: float, vol: int, last_px: float, mom_pct: float
         f"Notes: ranked by |gap| + volume."
     )
     pro = build_pro_block(sym, last_px, ref_px)
-    post(header + "\n\n" + pro); time.sleep(API_POST_SLEEP_S)
+    post(header + "\n\n" + pro)
+    append_signal_log(
+        {
+            "source": "premarket_gappers_dynamic",
+            "mode": mode,
+            "symbol": sym,
+            "session_signal": "FULL",
+            "tier": "FULL_PLAY",
+            "price": last_px,
+            "pct_change": gap_pct,
+            "rvol": None,
+            "volume": vol,
+            "spike": mom_pct,
+            "spike_1m": None,
+            "spike_5m": None,
+            "vwap": None,
+            "vwap_distance": None,
+            "recent_high": None,
+            "near_high": None,
+            "is_float_candidate": None,
+            "filing_type": None,
+            "dollar_volume": dollarv,
+        }
+    )
+    time.sleep(API_POST_SLEEP_S)
 
 # ───────────────── Scan ─────────────────
 def in_fast_mode(mode: str) -> bool:
@@ -376,6 +483,7 @@ def scan_once():
 
     T = THRESH[mode]
     watch_hits, full_hits = [], []
+    prev_closes = previous_closes(list(df["symbol"].unique())) if mode == "PM" else {}
 
     for sym in df["symbol"].unique():
         sdf = df[df["symbol"] == sym]
@@ -384,7 +492,11 @@ def scan_once():
 
         open_px = float(sdf.iloc[0]["open"])
         last_px = float(sdf.iloc[-1]["close"])
-        if not (PRICE_MIN <= last_px <= PRICE_MAX):
+        gate_price = prev_closes.get(sym, last_px) if mode == "PM" else last_px
+        if mode == "PM":
+            if not (PREV_CLOSE_PRICE_MIN <= gate_price <= PREV_CLOSE_PRICE_MAX):
+                continue
+        elif not (PRICE_MIN <= gate_price <= PRICE_MAX):
             continue
 
         vol = int(sdf["volume"].sum())

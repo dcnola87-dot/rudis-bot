@@ -56,6 +56,8 @@ RTH_MICROCAP_MOMO_TOP = int(os.getenv("RTH_MICROCAP_MOMO_TOP", "60"))
 RTH_DISCOVERY_ACTIVE_SAMPLE = int(os.getenv("RTH_DISCOVERY_ACTIVE_SAMPLE", "500"))
 OPENING_FALLBACK_MINUTES = int(os.getenv("RTH_OPENING_FALLBACK_MINUTES", "20"))
 SIGNAL_COOLDOWN_SEC = int(os.getenv("RTH_SIGNAL_COOLDOWN_SEC", "900"))
+SMART_DEDUPE_WINDOW_SEC = 30 * 60
+SMART_DEDUPE_PRICE_MOVE_PCT = 20.0
 DEBUG_RTH = os.getenv("STOCK_DEBUG", os.getenv("RTH_DEBUG", "0")) == "1"
 DEBUG_MISSES = os.getenv("STOCK_DEBUG_MISSES", "0") == "1"
 DEBUG_MISS_SYMBOLS = {
@@ -310,26 +312,53 @@ def append_signal_log(sig: dict):
 def reset_signal_cache(cache: dict) -> dict:
     today = datetime.now(CT).strftime("%Y-%m-%d")
     if cache.get("day") != today:
-        return {"day": today, "signals": {}}
-    cache.setdefault("signals", {})
+        return {"day": today, "symbols": {}}
+    cache.setdefault("symbols", {})
     return cache
 
 
-def signal_cache_key(sig: dict) -> str:
-    return f"{sig['symbol'].upper()}::{sig['session_signal'].upper()}::{sig['tier'].upper()}"
+def signal_type(sig: dict) -> str:
+    return f"{sig['session_signal'].upper()}::{sig['tier'].upper()}"
 
 
-def should_post_signal(sig: dict, cache: dict, now_ts: float) -> tuple[bool, str | None]:
-    key = signal_cache_key(sig)
-    last_ts = float((cache.get("signals") or {}).get(key) or 0.0)
-    if last_ts and now_ts - last_ts < SIGNAL_COOLDOWN_SEC:
-        return False, key
-    return True, key
+def should_post_signal(sig: dict, cache: dict, now_ts: float) -> tuple[bool, str]:
+    symbol = sig["symbol"].upper()
+    sig_type = signal_type(sig)
+    current_price = float(sig["price"])
+    entry = ((cache.get("symbols") or {}).get(symbol) or {})
+    last_type = str(entry.get("signal_type") or "")
+    last_price_raw = entry.get("price")
+    last_ts = float(entry.get("timestamp") or 0.0)
+
+    if not last_type or last_price_raw in (None, "") or not last_ts:
+        return True, symbol
+
+    try:
+        last_price = float(last_price_raw)
+    except (TypeError, ValueError):
+        return True, symbol
+
+    if sig_type != last_type:
+        return True, symbol
+
+    if last_price > 0:
+        price_move_pct = abs((current_price / last_price - 1.0) * 100.0)
+        if price_move_pct >= SMART_DEDUPE_PRICE_MOVE_PCT:
+            return True, symbol
+
+    if now_ts - last_ts < SMART_DEDUPE_WINDOW_SEC:
+        return False, symbol
+
+    return True, symbol
 
 
-def mark_signal_posted(cache: dict, key: str, now_ts: float):
-    cache.setdefault("signals", {})
-    cache["signals"][key] = now_ts
+def mark_signal_posted(cache: dict, symbol: str, sig: dict, now_ts: float):
+    cache.setdefault("symbols", {})
+    cache["symbols"][symbol.upper()] = {
+        "signal_type": signal_type(sig),
+        "price": sig["price"],
+        "timestamp": now_ts,
+    }
 
 
 def _clean_symbols(values):
@@ -1412,15 +1441,14 @@ def main():
                 snapshots.get(sym) or {},
             )
             if sig:
-                should_post, cache_key = should_post_signal(sig, signal_cache, now_ts)
+                should_post, cache_symbol = should_post_signal(sig, signal_cache, now_ts)
                 if should_post:
                     discord(format_msg(sig))
                     append_signal_log(sig)
-                    if cache_key is not None:
-                        mark_signal_posted(signal_cache, cache_key, now_ts)
+                    mark_signal_posted(signal_cache, cache_symbol, sig, now_ts)
                     hits += 1
                 elif debug_miss_enabled(sig["symbol"]):
-                    debug_miss(sig["symbol"], "result", f"not_alerted cooldown_dedupe key={cache_key}")
+                    debug_miss(sig["symbol"], "result", f"not_alerted smart_dedupe symbol={cache_symbol}")
             elif rejection:
                 rejections.append(rejection)
 

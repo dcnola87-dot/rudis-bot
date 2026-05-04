@@ -18,7 +18,13 @@ ALPACA_TIMEOUT = int(os.getenv("ALPACA_TIMEOUT", "20"))
 DATA_BASE = os.getenv("ALPACA_DATA_BARS_URL", "https://data.alpaca.markets/v2/stocks/bars")
 SIGNAL_LOG_PATH = Path(os.getenv("RTH_SIGNAL_LOG_PATH", "logs/stock_signal_calls.jsonl"))
 GRADE_WEBHOOK = os.getenv("RTH_GRADE_WEBHOOK", os.getenv("STOCKS_WEBHOOK", ""))
-POST_DISCORD = os.getenv("RTH_GRADE_POST_DISCORD", "0") == "1"
+GRADE_CHANNEL_ID = (
+    os.getenv("RTH_GRADE_CHANNEL_ID")
+    or os.getenv("DISCORD_LOG_CHANNEL_ID")
+    or "1477258116268560454"
+).strip()
+DISCORD_BOT_TOKEN = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
+POST_DISCORD = os.getenv("RTH_GRADE_POST_DISCORD", "1") == "1"
 
 
 def alpaca_headers():
@@ -52,6 +58,19 @@ def load_signal_rows(target_date: str) -> list[dict]:
                 row["_logged_at_et_dt"] = dt.astimezone(ET)
                 rows.append(row)
     return rows
+
+
+def setup_label(row: dict) -> str:
+    mode = str(row.get("mode") or "").upper()
+    tier = str(row.get("tier") or "").upper()
+    if mode and tier:
+        return f"{mode}:{tier}"
+    if tier:
+        return tier
+    signal = str(row.get("session_signal") or "").upper()
+    if mode and signal:
+        return f"{mode}:{signal}"
+    return signal or "UNKNOWN"
 
 
 def resolve_target_date() -> str:
@@ -144,6 +163,10 @@ def grade_signal(row: dict) -> dict:
     return_30m_pct = (p30 / entry - 1.0) * 100.0 if p30 else None
 
     tier = str(row.get("tier") or "").upper()
+    signal = str(row.get("session_signal") or "").upper()
+    mode = str(row.get("mode") or "").upper()
+    setup = setup_label(row)
+
     if tier == "CONFIRMED":
         grade = "good" if max_return_pct >= 5 and return_close_pct >= 0 else "bad"
     elif tier == "EARLY":
@@ -152,11 +175,16 @@ def grade_signal(row: dict) -> dict:
         grade = "good" if max_return_pct >= 8 else "bad"
     elif tier == "EXTENDED":
         grade = "good" if max_return_pct >= 2 else "bad"
+    elif tier == "EARLY_WATCH" or (mode in {"PM", "AH"} and signal == "WATCH"):
+        grade = "good" if max_return_pct >= 3 else "bad"
+    elif tier == "FULL_PLAY" or (mode in {"PM", "AH"} and signal == "FULL"):
+        grade = "good" if max_return_pct >= 5 and return_close_pct >= 0 else "bad"
     else:
         grade = "good" if max_return_pct >= 3 else "bad"
 
     return {
         **row,
+        "setup": setup,
         "grade": grade,
         "max_return_pct": max_return_pct,
         "min_return_pct": min_return_pct,
@@ -180,9 +208,9 @@ def print_report(results: list[dict], target_date: str):
 
     by_tier = defaultdict(list)
     for row in results:
-        by_tier[str(row.get("tier") or "UNKNOWN").upper()].append(row)
+        by_tier[str(row.get("setup") or "UNKNOWN").upper()].append(row)
 
-    print("By tier")
+    print("By setup")
     for tier in sorted(by_tier):
         rows = by_tier[tier]
         good = sum(1 for row in rows if row.get("grade") == "good")
@@ -195,7 +223,7 @@ def print_report(results: list[dict], target_date: str):
     best = sorted(results, key=lambda row: row.get("max_return_pct") or -9999, reverse=True)[:10]
     for row in best:
         print(
-            f" - {row['symbol']} {row['tier']} entry={row['price']:.2f} "
+            f" - {row['symbol']} {row.get('setup', row.get('tier', 'UNKNOWN'))} entry={row['price']:.2f} "
             f"max={fmt_pct(row.get('max_return_pct'))} close={fmt_pct(row.get('return_close_pct'))} "
             f"grade={row['grade']}"
         )
@@ -205,7 +233,7 @@ def print_report(results: list[dict], target_date: str):
     worst = sorted(results, key=lambda row: row.get("min_return_pct") or 9999)[:10]
     for row in worst:
         print(
-            f" - {row['symbol']} {row['tier']} entry={row['price']:.2f} "
+            f" - {row['symbol']} {row.get('setup', row.get('tier', 'UNKNOWN'))} entry={row['price']:.2f} "
             f"min={fmt_pct(row.get('min_return_pct'))} close={fmt_pct(row.get('return_close_pct'))} "
             f"grade={row['grade']}"
         )
@@ -214,13 +242,13 @@ def print_report(results: list[dict], target_date: str):
 def build_discord_report(results: list[dict], target_date: str) -> str:
     by_tier = defaultdict(list)
     for row in results:
-        by_tier[str(row.get("tier") or "UNKNOWN").upper()].append(row)
+        by_tier[str(row.get("setup") or "UNKNOWN").upper()].append(row)
 
     lines = [
         f"📘 **Stock EOD Report** `{target_date}`",
         f"Signals graded: **{len(results)}**",
         "",
-        "**By Tier**",
+        "**By Setup**",
     ]
     for tier in sorted(by_tier):
         rows = by_tier[tier]
@@ -238,7 +266,7 @@ def build_discord_report(results: list[dict], target_date: str) -> str:
     lines.append("**Best Calls**")
     for row in best:
         lines.append(
-            f"- `{row['symbol']}` {row['tier']} max={fmt_pct(row.get('max_return_pct'))} "
+            f"- `{row['symbol']}` {row.get('setup', row.get('tier', 'UNKNOWN'))} max={fmt_pct(row.get('max_return_pct'))} "
             f"close={fmt_pct(row.get('return_close_pct'))} grade={row['grade']}"
         )
 
@@ -246,7 +274,7 @@ def build_discord_report(results: list[dict], target_date: str) -> str:
     lines.append("**Worst Drawdowns**")
     for row in worst:
         lines.append(
-            f"- `{row['symbol']}` {row['tier']} min={fmt_pct(row.get('min_return_pct'))} "
+            f"- `{row['symbol']}` {row.get('setup', row.get('tier', 'UNKNOWN'))} min={fmt_pct(row.get('min_return_pct'))} "
             f"close={fmt_pct(row.get('return_close_pct'))} grade={row['grade']}"
         )
 
@@ -254,9 +282,23 @@ def build_discord_report(results: list[dict], target_date: str) -> str:
 
 
 def post_discord_report(report_text: str):
-    if not POST_DISCORD or not GRADE_WEBHOOK:
+    if not POST_DISCORD:
         return
-    requests.post(GRADE_WEBHOOK, json={"content": report_text[:1900]}, timeout=15)
+
+    if DISCORD_BOT_TOKEN and GRADE_CHANNEL_ID.isdigit():
+        requests.post(
+            f"https://discord.com/api/v10/channels/{GRADE_CHANNEL_ID}/messages",
+            headers={
+                "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"content": report_text[:1900]},
+            timeout=15,
+        ).raise_for_status()
+        return
+
+    if GRADE_WEBHOOK:
+        requests.post(GRADE_WEBHOOK, json={"content": report_text[:1900]}, timeout=15).raise_for_status()
 
 
 def main():
