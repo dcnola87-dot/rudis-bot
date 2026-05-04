@@ -21,6 +21,9 @@ MOST_ACTIVES_URL = os.getenv("ALPACA_MOST_ACTIVES_URL", "https://data.alpaca.mar
 MOVERS_URL = os.getenv("ALPACA_MOVERS_URL", "https://data.alpaca.markets/v1beta1/screener/stocks/movers")
 SNAPSHOTS_URL = os.getenv("ALPACA_SNAPSHOTS_URL", "https://data.alpaca.markets/v2/stocks/snapshots")
 EDGAR_SEARCH_URL = os.getenv("SEC_EDGAR_SEARCH_URL", "https://efts.sec.gov/LATEST/search-index")
+BENZINGA_NEWS_URL = os.getenv("BENZINGA_NEWS_URL", "https://api.benzinga.com/api/v2/news")
+BENZINGA_TOKEN = (os.getenv("BENZINGA_TOKEN") or "demo").strip()
+BENZINGA_NEWS_LOOKBACK_HOURS = int(os.getenv("BENZINGA_NEWS_LOOKBACK_HOURS", "4"))
 
 # Alpaca Market Data (bars) endpoint
 # Default is the official Alpaca data API. You can override with ALPACA_DATA_BARS_URL if needed.
@@ -679,9 +682,11 @@ def load_symbols():
         most_active = fetch_most_active_symbols()
         top_gainers = fetch_gainer_symbols()
         low_float = load_low_float_watchlist()
+        recent_news = fetch_recent_benzinga_symbols()
 
         discovery_pool = _clean_symbols(
-            top_gainers
+            recent_news
+            + top_gainers
             + most_active
             + low_float
             + active[:max(RTH_DISCOVERY_ACTIVE_SAMPLE, session_cap)]
@@ -691,6 +696,7 @@ def load_symbols():
 
         syms = _clean_symbols(
             microcap_momo
+            + recent_news
             + priority
             + top_gainers
             + top_rvol
@@ -702,7 +708,7 @@ def load_symbols():
         if DEBUG_RTH:
             discord(
                 "🧪 RTH debug: discovery "
-                f"microcap={len(microcap_momo)} priority={len(priority)} gainers={len(top_gainers)} "
+                f"microcap={len(microcap_momo)} news={len(recent_news)} priority={len(priority)} gainers={len(top_gainers)} "
                 f"rvol={len(top_rvol)} sub10={len(sub10_momo)} low_float={len(low_float)} "
                 f"most_active={len(most_active)} active={len(active)} cap={session_cap}"
             )
@@ -711,6 +717,7 @@ def load_symbols():
                 final_syms = syms[:session_cap]
                 discovery_sets = {
                     "microcap_momo": set(microcap_momo),
+                    "recent_news": set(recent_news),
                     "priority": set(priority),
                     "top_gainers": set(top_gainers),
                     "top_rvol": set(top_rvol),
@@ -853,6 +860,69 @@ def fetch_recent_8k(symbol: str) -> dict | None:
         }
     except Exception:
         return None
+
+
+def _benzinga_cutoff_ts() -> int:
+    return int((datetime.now(ET) - timedelta(hours=max(BENZINGA_NEWS_LOOKBACK_HOURS, 1))).timestamp())
+
+
+def fetch_recent_benzinga_news(symbol: str) -> dict | None:
+    if not BENZINGA_TOKEN:
+        return None
+
+    params = {
+        "token": BENZINGA_TOKEN,
+        "tickers": symbol.upper(),
+        "pageSize": 5,
+        "displayOutput": "headline",
+        "publishedSince": _benzinga_cutoff_ts(),
+        "sort": "updated:desc",
+    }
+    try:
+        r = requests.get(BENZINGA_NEWS_URL, params=params, timeout=5)
+        r.raise_for_status()
+        payload = r.json() or []
+        if not isinstance(payload, list) or not payload:
+            return None
+        item = payload[0] or {}
+        title = str(item.get("title") or "").strip()
+        created = str(item.get("created") or item.get("updated") or "").strip()
+        return {
+            "filing_type": "CATALYST",
+            "headline": title or "Recent Benzinga headline",
+            "source": "benzinga",
+            "created": created,
+        }
+    except Exception:
+        return None
+
+
+def fetch_recent_benzinga_symbols() -> list[str]:
+    if not BENZINGA_TOKEN:
+        return []
+
+    params = {
+        "token": BENZINGA_TOKEN,
+        "pageSize": 100,
+        "displayOutput": "headline",
+        "publishedSince": _benzinga_cutoff_ts(),
+        "sort": "updated:desc",
+    }
+    try:
+        r = requests.get(BENZINGA_NEWS_URL, params=params, timeout=6)
+        r.raise_for_status()
+        payload = r.json() or []
+    except Exception:
+        return []
+
+    symbols: list[str] = []
+    for item in payload if isinstance(payload, list) else []:
+        stocks = item.get("stocks") or []
+        for stock in stocks:
+            sym = str((stock or {}).get("name") or (stock or {}).get("symbol") or "").strip().upper()
+            if sym:
+                symbols.append(sym)
+    return _clean_symbols(symbols)
 
 
 def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
@@ -1253,7 +1323,7 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
 
     catalyst = None
     if tier == "EARLY":
-        catalyst = fetch_recent_8k(sym)
+        catalyst = fetch_recent_benzinga_news(sym) or fetch_recent_8k(sym)
 
     if debug_miss_enabled(sym):
         debug_miss(
@@ -1276,6 +1346,7 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
         "session_signal": session_signal,
         "tier": tier,
         "filing_type": catalyst["filing_type"] if catalyst else None,
+        "catalyst_headline": catalyst.get("headline") if catalyst else None,
         "is_float_candidate": sym.upper() in FLOAT_CANDIDATES,
         "recent_high": recent_high,
         "near_high": near_high,
@@ -1297,6 +1368,8 @@ def format_msg(sig):
         notes.append(tier["tagline"])
     if sig.get("filing_type"):
         notes.append(sig["filing_type"])
+    if sig.get("catalyst_headline"):
+        notes.append(sig["catalyst_headline"])
     return (
         f"{tier['emoji']} **{tier['label']}** | **{sig['symbol']}** | "
         f"{sig['pct_change']:+.1f}% | RVOL {sig['rvol']:.1f}x | "
