@@ -199,7 +199,7 @@ def debug_miss(symbol: str, stage: str, detail: str):
 
 
 def _cache_template() -> dict:
-    return {"day": "", "signals": {}}
+    return {"day": "", "symbols": {}}
 
 
 def load_signal_cache() -> dict:
@@ -208,7 +208,7 @@ def load_signal_cache() -> dict:
             raw = json.loads(SIGNAL_CACHE_PATH.read_text())
             if isinstance(raw, dict):
                 raw.setdefault("day", "")
-                raw.setdefault("signals", {})
+                raw.setdefault("symbols", {})
                 return raw
         except Exception:
             pass

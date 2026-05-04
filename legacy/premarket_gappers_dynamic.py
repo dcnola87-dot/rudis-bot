@@ -25,6 +25,7 @@ CT = ZoneInfo("America/Chicago")
 ROOT = Path(__file__).resolve().parent
 CACHE_PATH      = ROOT / ".posted_cache_dynamic.json"
 FAST_DEDUPE     = ROOT / ".fast_recent_posts.json"     # short cooldown memory
+SIGNAL_CACHE_PATH = Path(os.getenv("RTH_SIGNAL_CACHE_PATH", ".rth_signal_cache.json"))
 LOG_FILE        = ROOT / "logs" / "scanner.log"
 SIGNAL_LOG_PATH = ROOT / "logs" / "stock_signal_calls.jsonl"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -50,6 +51,8 @@ TOP_N = 12
 API_POST_SLEEP_S = 0.25
 BULLISH_ONLY = True
 COOLDOWN_MIN = 3        # per-symbol dedupe window to reduce chatter
+SMART_DEDUPE_WINDOW_SEC = 30 * 60
+SMART_DEDUPE_PRICE_MOVE_PCT = 20.0
 
 # ───────────────── Alpaca (optional for RTH) ─────────────────
 try:
@@ -118,6 +121,10 @@ def load_json(path: Path, default):
 def save_json(path: Path, obj):
     path.write_text(json.dumps(obj))
 
+
+def _signal_cache_template() -> Dict:
+    return {"day": "", "symbols": {}}
+
 def _cache_template() -> Dict:
     return {"watch": {}, "full": {}, "_day": ""}
 
@@ -135,6 +142,78 @@ def load_fast_memo() -> Dict:
 
 def save_fast_memo(m: Dict) -> None:
     save_json(FAST_DEDUPE, m)
+
+
+def load_signal_cache() -> Dict:
+    if SIGNAL_CACHE_PATH.exists():
+        try:
+            raw = json.loads(SIGNAL_CACHE_PATH.read_text())
+            if isinstance(raw, dict):
+                raw.setdefault("day", "")
+                raw.setdefault("symbols", {})
+                return raw
+        except Exception:
+            pass
+    return _signal_cache_template()
+
+
+def save_signal_cache(cache: Dict) -> None:
+    try:
+        SIGNAL_CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+
+def reset_signal_cache(cache: Dict) -> Dict:
+    today = datetime.now(CT).strftime("%Y-%m-%d")
+    if cache.get("day") != today:
+        return {"day": today, "symbols": {}}
+    cache.setdefault("symbols", {})
+    return cache
+
+
+def signal_type(sig: Dict) -> str:
+    return f"{sig['session_signal'].upper()}::{sig['tier'].upper()}"
+
+
+def should_post_signal(sig: Dict, cache: Dict, now_ts: float) -> tuple[bool, str]:
+    symbol = sig["symbol"].upper()
+    sig_type = signal_type(sig)
+    current_price = float(sig["price"])
+    entry = ((cache.get("symbols") or {}).get(symbol) or {})
+    last_type = str(entry.get("signal_type") or "")
+    last_price_raw = entry.get("price")
+    last_ts = float(entry.get("timestamp") or 0.0)
+
+    if not last_type or last_price_raw in (None, "") or not last_ts:
+        return True, symbol
+
+    try:
+        last_price = float(last_price_raw)
+    except (TypeError, ValueError):
+        return True, symbol
+
+    if sig_type != last_type:
+        return True, symbol
+
+    if last_price > 0:
+        price_move_pct = abs((current_price / last_price - 1.0) * 100.0)
+        if price_move_pct >= SMART_DEDUPE_PRICE_MOVE_PCT:
+            return True, symbol
+
+    if now_ts - last_ts < SMART_DEDUPE_WINDOW_SEC:
+        return False, symbol
+
+    return True, symbol
+
+
+def mark_signal_posted(cache: Dict, symbol: str, sig: Dict, now_ts: float) -> None:
+    cache.setdefault("symbols", {})
+    cache["symbols"][symbol.upper()] = {
+        "signal_type": signal_type(sig),
+        "price": sig["price"],
+        "timestamp": now_ts,
+    }
 
 def reset_day_dict(d: Dict, today: str, template: Dict) -> Dict:
     base = {
@@ -536,11 +615,7 @@ def scan_once():
 
 # ───────────────── Controller ─────────────────
 def main_once():
-    cache = load_cache()
-    fast = load_fast_memo()
-    today = datetime.now(CT).strftime("%Y-%m-%d")
-    cache = reset_day_dict(cache, today, _cache_template())
-    fast  = reset_day_dict(fast, today, _fast_memo_template())
+    signal_cache = reset_signal_cache(load_signal_cache())
 
     watch, full, mode, _ = scan_once()
     if mode is None:
@@ -552,35 +627,38 @@ def main_once():
     now_s = time.time()
 
     for sym, gap, vol, last_px, mom, dollarv, ref_px, sdf in watch:
-        # day-level dedupe
-        if cache["watch"].get(sym) == cache["_day"]:
-            continue
-        # short cooldown dedupe
-        last_t = fast["last"].get(sym, 0)
-        if now_s - last_t < COOLDOWN_MIN * 60:
+        sig = {
+            "symbol": sym,
+            "session_signal": "WATCH",
+            "tier": "EARLY_WATCH",
+            "price": last_px,
+        }
+        should_post, cache_symbol = should_post_signal(sig, signal_cache, now_s)
+        if not should_post:
             continue
         try:
             post_watch(sym, gap, vol, last_px, mom, dollarv, mode, sdf)
-            cache["watch"][sym] = cache["_day"]
-            fast["last"][sym] = now_s
+            mark_signal_posted(signal_cache, cache_symbol, sig, now_s)
         except Exception as e:
             log(f"watch post err {sym}: {e}")
 
     for sym, gap, vol, last_px, mom, dollarv, ref_px, sdf in full:
-        if cache["full"].get(sym) == cache["_day"]:
-            continue
-        last_t = fast["last"].get(sym, 0)
-        if now_s - last_t < COOLDOWN_MIN * 60:
+        sig = {
+            "symbol": sym,
+            "session_signal": "FULL",
+            "tier": "FULL_PLAY",
+            "price": last_px,
+        }
+        should_post, cache_symbol = should_post_signal(sig, signal_cache, now_s)
+        if not should_post:
             continue
         try:
             post_full(sym, gap, vol, last_px, mom, dollarv, mode, ref_px)
-            cache["full"][sym] = cache["_day"]
-            fast["last"][sym] = now_s
+            mark_signal_posted(signal_cache, cache_symbol, sig, now_s)
         except Exception as e:
             log(f"full post err {sym}: {e}")
 
-    save_cache(cache)
-    save_fast_memo(fast)
+    save_signal_cache(signal_cache)
 
 def run_loop():
     # 05:00–20:30 CT to include PM, RTH, AH, with a small buffer
