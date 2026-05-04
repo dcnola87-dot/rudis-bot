@@ -101,7 +101,7 @@ TIER_PROFILES = {
         "price_max": 25.0,
         "min_daily_vol": 750_000,
         "min_rvol": 3.0,
-        "min_pct": 8.0,
+        "min_pct": 5.0,
         "min_spike": max(VOL_SPIKE_X, 2.0),
         "max_pct": None,
         "timeframe": CONFIRMED_TIMEFRAME,
@@ -116,7 +116,7 @@ TIER_PROFILES = {
         "price_max": 25.0,
         "min_daily_vol": 250_000,
         "min_rvol": 1.5,
-        "min_pct": 2.0,
+        "min_pct": 3.0,
         "min_spike": 1.2,
         "max_pct": 12.0,
         "timeframe": EARLY_TIMEFRAME,
@@ -1049,7 +1049,7 @@ def choose_signal_and_tier(
     if rvol < 1.2 and pct_change > 10:
         return "FADING", None, ["classified FADING: low RVOL versus extended move"]
 
-    if rvol_thresholds["watch"] <= rvol < rvol_thresholds["early"] and 2.0 <= pct_change < 3.0 and volume >= 250_000:
+    if rvol_thresholds["watch"] <= rvol < rvol_thresholds["early"] and 3.0 <= pct_change < 4.0 and volume >= 250_000:
         return "WATCH", "WATCH", []
 
     early_metrics = metrics_by_timeframe.get(EARLY_TIMEFRAME) or {}
@@ -1098,7 +1098,10 @@ def choose_signal_and_tier(
         spike = float(metrics.get("spike") or 0.0)
         if spike < min_spike:
             tier_reasons.append(f"bar spike {spike:.1f}x < {min_spike:.1f}x")
-        if tier["require_vwap_hold"] and price < vwap:
+        min_vwap_ratio = 1.0
+        if tier_name in {"CONFIRMED", "EXTENDED", "CASINO"}:
+            min_vwap_ratio = 0.98
+        if tier["require_vwap_hold"] and vwap > 0 and price < vwap * min_vwap_ratio:
             tier_reasons.append(f"below VWAP by {(vwap - price) / vwap:.1%}")
         if tier_name == "EARLY" and vwap > 0:
             min_vwap_hold = 0.98 if not rth_opening else 0.975
@@ -1111,6 +1114,8 @@ def choose_signal_and_tier(
                 tier_reasons.append(f"not close enough to highs ({price / recent_high:.1%} of recent high)")
         if tier_name == "CASINO" and not is_float_candidate and price > 8.0:
             tier_reasons.append("casino profile reserved for sub-$8 squeezes")
+        if tier_name == "CASINO" and pct_change <= 0:
+            tier_reasons.append("casino requires positive move on the day")
 
         if opening_fallback and tier_name in {"EARLY", "CASINO"}:
             tier_reasons = [reason for reason in tier_reasons if "not enough bars" not in reason]
