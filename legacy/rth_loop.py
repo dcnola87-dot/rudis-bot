@@ -13,6 +13,8 @@ CT = ZoneInfo("America/Chicago")
 EOD_REPORT_ENABLED = os.getenv("RTH_EOD_REPORT", "1") == "1"
 EOD_REPORT_HOUR = int(os.getenv("RTH_EOD_REPORT_HOUR", "18"))
 EOD_REPORT_MINUTE = int(os.getenv("RTH_EOD_REPORT_MINUTE", "5"))
+GAP_SCAN_HOUR = int(os.getenv("RTH_GAP_SCAN_HOUR", "6"))
+GAP_SCAN_MINUTE = int(os.getenv("RTH_GAP_SCAN_MINUTE", "0"))
 
 def discord(msg: str):
     if not WEBHOOK:
@@ -46,23 +48,21 @@ def current_session(ts: datetime) -> str | None:
 
 def scan_interval_seconds(ts: datetime, session: str | None) -> int:
     if session == "premarket":
-        return 15
+        return 180
     if session == "rth":
         mins = ts.hour * 60 + ts.minute
         rth_start = 8 * 60 + 30
-        first_hour_end = 9 * 60 + 30
-        last_hour_start = 14 * 60
-        if rth_start <= mins < first_hour_end:
-            return 15
-        if mins >= last_hour_start:
-            return 15
-        return 30
+        fast_window_end = 10 * 60
+        if rth_start <= mins < fast_window_end:
+            return 180
+        return 600
     if session == "afterhours":
-        return 30
+        return 600
     return 60
 
 started_today = None  # date we already announced
 eod_report_sent_for = None
+gap_scan_sent_for = None
 
 while True:
     now = datetime.now(CT)
@@ -73,6 +73,19 @@ while True:
         if started_today != now.date():
             discord("✅ **Rudis stock scanner is LIVE** (3:00 AM–6:00 PM CT).")
             started_today = now.date()
+
+        if (
+            session == "premarket"
+            and gap_scan_sent_for != now.date()
+            and (
+                now.hour > GAP_SCAN_HOUR
+                or (now.hour == GAP_SCAN_HOUR and now.minute >= GAP_SCAN_MINUTE)
+            )
+        ):
+            env = os.environ.copy()
+            env["RUDIS_GAP_SCAN_ONLY"] = "1"
+            subprocess.run([sys.executable, "premarket_gappers_dynamic.py"], env=env)
+            gap_scan_sent_for = now.date()
 
         # Run scanner on a tighter cadence during active windows.
         env = os.environ.copy()

@@ -24,6 +24,10 @@ EDGAR_SEARCH_URL = os.getenv("SEC_EDGAR_SEARCH_URL", "https://efts.sec.gov/LATES
 BENZINGA_NEWS_URL = os.getenv("BENZINGA_NEWS_URL", "https://api.benzinga.com/api/v2/news")
 BENZINGA_TOKEN = (os.getenv("BENZINGA_TOKEN") or "demo").strip()
 BENZINGA_NEWS_LOOKBACK_HOURS = int(os.getenv("BENZINGA_NEWS_LOOKBACK_HOURS", "4"))
+MIN_PREV_CLOSE_PRICE = 0.10
+MAX_PREV_CLOSE_PRICE = 5.00
+MIN_SIGNAL_DOLLAR_VOLUME = 500_000.0
+MAX_NORMAL_RVOL = 500.0
 
 # Alpaca Market Data (bars) endpoint
 # Default is the official Alpaca data API. You can override with ALPACA_DATA_BARS_URL if needed.
@@ -68,6 +72,7 @@ DEBUG_MISS_SYMBOLS = {
     for s in (os.getenv("STOCK_DEBUG_SYMBOLS", "") or "").split(",")
     if s.strip()
 }
+DEBUG_MISS_SYMBOLS.update({"SOBR", "CNSP", "KIDZ"})
 POST_NO_SIGNAL = os.getenv("STOCK_POST_NO_SIGNAL", os.getenv("RTH_POST_NO_SIGNAL", "0")) == "1"
 REJECTION_SUMMARY_LIMIT = int(os.getenv("RTH_REJECTION_SUMMARY_LIMIT", "10"))
 RTH_CHUNK_SIZE = int(os.getenv("RTH_CHUNK_SIZE", "25"))
@@ -100,9 +105,9 @@ TIER_PROFILES = {
     "CONFIRMED": {
         "emoji": "✅",
         "label": "CONFIRMED",
-        "price_min": 2.0,
+        "price_min": 0.10,
         "price_max": 25.0,
-        "min_daily_vol": 750_000,
+        "min_dollar_volume": MIN_SIGNAL_DOLLAR_VOLUME,
         "min_rvol": 3.0,
         "min_pct": 5.0,
         "min_spike": max(VOL_SPIKE_X, 2.0),
@@ -115,9 +120,9 @@ TIER_PROFILES = {
     "WATCH": {
         "emoji": "👀",
         "label": "WATCH",
-        "price_min": 0.30,
+        "price_min": 0.10,
         "price_max": 25.0,
-        "min_daily_vol": 250_000,
+        "min_dollar_volume": MIN_SIGNAL_DOLLAR_VOLUME,
         "min_rvol": 1.5,
         "min_pct": 3.0,
         "min_spike": 1.2,
@@ -130,9 +135,9 @@ TIER_PROFILES = {
     "EXTENDED": {
         "emoji": "🟠",
         "label": "EXTENDED",
-        "price_min": 1.0,
+        "price_min": 0.10,
         "price_max": 25.0,
-        "min_daily_vol": 500_000,
+        "min_dollar_volume": MIN_SIGNAL_DOLLAR_VOLUME,
         "min_rvol": 2.0,
         "min_pct": 12.0,
         "min_spike": 1.3,
@@ -145,9 +150,9 @@ TIER_PROFILES = {
     "CASINO": {
         "emoji": "🎰",
         "label": "CASINO",
-        "price_min": 0.30,
+        "price_min": 0.10,
         "price_max": 8.0,
-        "min_daily_vol": 250_000,
+        "min_dollar_volume": MIN_SIGNAL_DOLLAR_VOLUME,
         "min_rvol": 3.0,
         "min_pct": 8.0,
         "min_spike": 1.5,
@@ -160,9 +165,9 @@ TIER_PROFILES = {
     "EARLY": {
         "emoji": "🟡",
         "label": "EARLY",
-        "price_min": 1.0,
+        "price_min": 0.10,
         "price_max": 25.0,
-        "min_daily_vol": 500_000,
+        "min_dollar_volume": MIN_SIGNAL_DOLLAR_VOLUME,
         "min_rvol": 2.0,
         "min_pct": 4.0,
         "min_spike": 1.5,
@@ -294,6 +299,7 @@ def append_signal_log(sig: dict):
         "pct_change": sig["pct_change"],
         "rvol": sig["rvol"],
         "volume": sig["volume"],
+        "dollar_volume": sig.get("dollar_volume"),
         "spike": sig["spike"],
         "spike_1m": sig.get("spike_1m"),
         "spike_5m": sig.get("spike_5m"),
@@ -872,8 +878,8 @@ def fetch_recent_benzinga_news(symbol: str) -> dict | None:
 
     params = {
         "token": BENZINGA_TOKEN,
-        "tickers": symbol.upper(),
-        "pageSize": 5,
+        "symbols": symbol.upper(),
+        "pagesize": 5,
         "displayOutput": "headline",
         "publishedSince": _benzinga_cutoff_ts(),
         "sort": "updated:desc",
@@ -888,7 +894,7 @@ def fetch_recent_benzinga_news(symbol: str) -> dict | None:
         title = str(item.get("title") or "").strip()
         created = str(item.get("created") or item.get("updated") or "").strip()
         return {
-            "filing_type": "CATALYST",
+            "filing_type": "EARLY + CATALYST",
             "headline": title or "Recent Benzinga headline",
             "source": "benzinga",
             "created": created,
@@ -903,7 +909,7 @@ def fetch_recent_benzinga_symbols() -> list[str]:
 
     params = {
         "token": BENZINGA_TOKEN,
-        "pageSize": 100,
+        "pagesize": 100,
         "displayOutput": "headline",
         "publishedSince": _benzinga_cutoff_ts(),
         "sort": "updated:desc",
@@ -933,6 +939,7 @@ def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
         vwap = float(snapshot["dailyBar"]["vw"])
         prev_close = float(snapshot["prevDailyBar"]["c"])
         prev_volume = float(snapshot["prevDailyBar"]["v"])
+        dollar_volume = price * volume
         vwap_distance = abs(price - vwap) / vwap if vwap > 0 else math.inf
         pct_change = ((price - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
         rvol = (volume / prev_volume) if prev_volume > 0 else 0.0
@@ -940,26 +947,30 @@ def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
 
         opening_microcap_exception = (
             _is_rth_opening_window()
-            and 0.30 <= price <= 2.0
-            and volume >= 40_000
+            and MIN_PREV_CLOSE_PRICE <= prev_close <= MAX_PREV_CLOSE_PRICE
+            and dollar_volume >= 250_000
             and pct_change >= 8.0
             and rvol >= 1.5
         )
 
-        if not (0.30 <= price <= 25.00):
-            reasons.append(f"price {price:.2f} outside 0.30-25.00")
-        if volume < 250_000 and not opening_microcap_exception:
-            reasons.append(f"volume {volume:,} < 250,000")
+        if not (MIN_PREV_CLOSE_PRICE <= prev_close <= MAX_PREV_CLOSE_PRICE):
+            reasons.append(f"prev close {prev_close:.2f} outside {MIN_PREV_CLOSE_PRICE:.2f}-{MAX_PREV_CLOSE_PRICE:.2f}")
+        if dollar_volume < MIN_SIGNAL_DOLLAR_VOLUME and not opening_microcap_exception:
+            reasons.append(f"dollar volume ${int(dollar_volume):,} < ${int(MIN_SIGNAL_DOLLAR_VOLUME):,}")
         if vwap <= 0:
             reasons.append("VWAP missing")
         elif vwap_distance > 0.40:
             reasons.append(f"VWAP distance {vwap_distance:.1%} > 40%")
+        if rvol > MAX_NORMAL_RVOL:
+            reasons.append(f"EXTREME SPIKE RVOL {rvol:.1f}x > {MAX_NORMAL_RVOL:.0f}x")
         if symbol.upper() in FLOAT_CANDIDATES:
             return {
                 "passed": not reasons,
                 "reasons": reasons,
                 "price": price,
                 "volume": volume,
+                "prev_close": prev_close,
+                "dollar_volume": dollar_volume,
                 "vwap": vwap,
                 "vwap_distance": vwap_distance,
                 "pct_change": pct_change,
@@ -975,6 +986,8 @@ def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
             "reasons": reasons,
             "price": price,
             "volume": volume,
+            "prev_close": prev_close,
+            "dollar_volume": dollar_volume,
             "vwap": vwap,
             "vwap_distance": vwap_distance,
             "pct_change": pct_change,
@@ -988,6 +1001,8 @@ def evaluate_prefilter(symbol: str, snapshot: dict) -> dict:
             "reasons": ["snapshot fields missing"],
             "price": None,
             "volume": None,
+            "prev_close": None,
+            "dollar_volume": None,
             "vwap": None,
             "vwap_distance": None,
         }
@@ -1107,6 +1122,7 @@ def choose_signal_and_tier(
     pct_change: float,
     rvol: float,
     volume: int,
+    dollar_volume: float,
     vwap: float,
     metrics_by_timeframe: dict,
     is_float_candidate: bool,
@@ -1116,10 +1132,13 @@ def choose_signal_and_tier(
     rth_opening = _is_rth_opening_window()
     rvol_thresholds = session_rvol_thresholds()
 
+    if rvol > MAX_NORMAL_RVOL:
+        return None, None, [f"EXTREME SPIKE RVOL {rvol:.1f}x > {MAX_NORMAL_RVOL:.0f}x"]
+
     if rvol < 1.2 and pct_change > 10:
         return "FADING", None, ["classified FADING: low RVOL versus extended move"]
 
-    if rvol_thresholds["watch"] <= rvol < rvol_thresholds["early"] and 3.0 <= pct_change < 4.0 and volume >= 250_000:
+    if rvol_thresholds["watch"] <= rvol < rvol_thresholds["early"] and 3.0 <= pct_change < 4.0 and dollar_volume >= MIN_SIGNAL_DOLLAR_VOLUME:
         return "WATCH", "WATCH", []
 
     early_metrics = metrics_by_timeframe.get(EARLY_TIMEFRAME) or {}
@@ -1133,8 +1152,8 @@ def choose_signal_and_tier(
             tier_reasons.extend(metrics.get("reasons") or ["bar metrics unavailable"])
         if not (tier["price_min"] <= price <= tier["price_max"]):
             tier_reasons.append(f"price {price:.2f} outside {tier['price_min']:.2f}-{tier['price_max']:.2f}")
-        if volume < tier["min_daily_vol"]:
-            tier_reasons.append(f"volume {volume:,} < {tier['min_daily_vol']:,}")
+        if dollar_volume < float(tier["min_dollar_volume"]):
+            tier_reasons.append(f"dollar volume ${int(dollar_volume):,} < ${int(tier['min_dollar_volume']):,}")
         min_rvol = tier["min_rvol"]
         if tier_name == "EARLY":
             min_rvol = rvol_thresholds["early"]
@@ -1157,7 +1176,7 @@ def choose_signal_and_tier(
                 opening_fallback
                 and tier_name in {"EARLY", "CASINO"}
                 and rvol >= 3.0
-                and volume >= 500_000
+                and dollar_volume >= MIN_SIGNAL_DOLLAR_VOLUME
             ):
                 tier_reasons.append(f"pct move {pct_change:+.1f}% > {max_pct:.1f}% anti-chase")
         min_spike = tier["min_spike"]
@@ -1190,11 +1209,11 @@ def choose_signal_and_tier(
         if opening_fallback and tier_name in {"EARLY", "CASINO"}:
             tier_reasons = [reason for reason in tier_reasons if "not enough bars" not in reason]
             fallback_rvol_gate = max(tier["min_rvol"], 3.0)
-            fallback_vol_gate = 750_000
+            fallback_dollar_gate = MIN_SIGNAL_DOLLAR_VOLUME
             if rth_opening:
                 fallback_rvol_gate = max(tier["min_rvol"] - 0.5, 2.0)
-                fallback_vol_gate = 400_000 if tier_name == "CASINO" else 600_000
-            if volume >= fallback_vol_gate and rvol >= fallback_rvol_gate:
+                fallback_dollar_gate = 250_000 if tier_name == "CASINO" else MIN_SIGNAL_DOLLAR_VOLUME
+            if dollar_volume >= fallback_dollar_gate and rvol >= fallback_rvol_gate:
                 tier_reasons = [reason for reason in tier_reasons if not reason.startswith("bar spike ")]
 
         if not tier_reasons:
@@ -1226,6 +1245,7 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
             "reasons": prefilter["reasons"],
             "price": prefilter.get("price"),
             "volume": prefilter.get("volume"),
+            "dollar_volume": prefilter.get("dollar_volume"),
             "vwap_distance": prefilter.get("vwap_distance"),
         }
 
@@ -1244,6 +1264,7 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
 
     pct = (price - prev_close) / prev_close * 100 if prev_close else 0
     rvol = (volume / prev_day_volume) if prev_day_volume > 0 else 0.0
+    dollar_volume = price * volume
     metrics_by_timeframe = {}
     for timeframe, lookback in (
         (EARLY_TIMEFRAME, EARLY_LOOKBACK_BARS),
@@ -1273,6 +1294,7 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
         pct_change=pct,
         rvol=rvol,
         volume=volume,
+        dollar_volume=dollar_volume,
         vwap=vwap,
         metrics_by_timeframe=metrics_by_timeframe,
         is_float_candidate=sym.upper() in FLOAT_CANDIDATES,
@@ -1308,6 +1330,7 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
         "pct_change": pct,
         "rvol": rvol,
         "volume": volume,
+        "dollar_volume": dollar_volume,
         "vwap_distance": prefilter.get("vwap_distance"),
         "bar_spike_1m": float(early_metrics.get("spike") or 0.0),
         "bar_spike_5m": float(confirmed_metrics.get("spike") or 0.0),
@@ -1343,6 +1366,7 @@ def analyze_symbol(sym, bars_by_timeframe, snapshot):
         "pct_change": pct,
         "rvol": rvol,
         "volume": volume,
+        "dollar_volume": dollar_volume,
         "session_signal": session_signal,
         "tier": tier,
         "filing_type": catalyst["filing_type"] if catalyst else None,

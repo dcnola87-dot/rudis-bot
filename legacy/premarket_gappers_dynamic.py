@@ -43,14 +43,13 @@ SLOW_LOOKBACK_MIN   = 60
 SLOW_BATCH          = 200
 
 MAX_SYMBOLS = 4000
-PRICE_MIN = 0.40
-PRICE_MAX = 40.00
-PREV_CLOSE_PRICE_MIN = 0.50
+PREV_CLOSE_PRICE_MIN = 0.10
 PREV_CLOSE_PRICE_MAX = 5.00
+MIN_SIGNAL_DOLLAR_VOLUME = 500_000.0
+GAP_WATCH_DOLLAR_VOLUME = 250_000.0
 TOP_N = 12
 API_POST_SLEEP_S = 0.25
 BULLISH_ONLY = True
-COOLDOWN_MIN = 3        # per-symbol dedupe window to reduce chatter
 SMART_DEDUPE_WINDOW_SEC = 30 * 60
 SMART_DEDUPE_PRICE_MOVE_PCT = 20.0
 
@@ -109,6 +108,38 @@ def post(msg: str) -> None:
         requests.post(WEBHOOK, json={"content": msg}, timeout=6)
     except Exception as e:
         log(f"Webhook post error: {e}")
+
+
+def post_gap_watch(sym: str, gap_pct: float, last_px: float, prev_close: float, dollarv: float) -> None:
+    msg = (
+        f"🧭 **GAP WATCH** {sym} — gap {gap_pct:.1f}% _(mode: PM)_\n"
+        f"Last: ${last_px:.2f} | Prev Close: ${prev_close:.2f} | $Vol: ${int(dollarv):,}\n"
+        f"_Dedicated 6:00 AM CT pre-market gap scan._"
+    )
+    post(msg)
+    append_signal_log(
+        {
+            "source": "premarket_gappers_dynamic",
+            "mode": "PM",
+            "symbol": sym,
+            "session_signal": "GAP",
+            "tier": "GAP_WATCH",
+            "price": last_px,
+            "pct_change": gap_pct,
+            "rvol": None,
+            "volume": None,
+            "spike": None,
+            "spike_1m": None,
+            "spike_5m": None,
+            "vwap": None,
+            "vwap_distance": None,
+            "recent_high": None,
+            "near_high": None,
+            "is_float_candidate": None,
+            "filing_type": None,
+            "dollar_volume": dollarv,
+        }
+    )
 
 def load_json(path: Path, default):
     if path.exists():
@@ -317,6 +348,61 @@ def previous_closes(symbols: List[str]) -> Dict[str, float]:
         except Exception:
             continue
     return closes
+
+
+def run_gap_watch_scan() -> None:
+    ts = now_et()
+    mode, start_et, _ = current_window_et(ts)
+    if mode != "PM":
+        return
+
+    uni = get_universe()
+    if not uni:
+        return
+
+    prev_closes = previous_closes(uni)
+    candidates = [sym for sym in uni if PREV_CLOSE_PRICE_MIN <= prev_closes.get(sym, 0.0) <= PREV_CLOSE_PRICE_MAX]
+    if not candidates:
+        return
+
+    df = yahoo_1m(candidates, start_et, ts)
+    if df.empty:
+        return
+
+    signal_cache = reset_signal_cache(load_signal_cache())
+    now_s = time.time()
+    hits: list[tuple[str, float, float, float]] = []
+
+    for sym in df["symbol"].unique():
+        sdf = df[df["symbol"] == sym]
+        if sdf.empty:
+            continue
+        prev_close = float(prev_closes.get(sym) or 0.0)
+        if not (PREV_CLOSE_PRICE_MIN <= prev_close <= PREV_CLOSE_PRICE_MAX):
+            continue
+        last_px = float(sdf.iloc[-1]["close"])
+        vol = int(sdf["volume"].sum())
+        dollarv = last_px * vol
+        gap_pct = ((last_px / prev_close) - 1.0) * 100.0 if prev_close > 0 else 0.0
+        if gap_pct < 10.0 or dollarv < GAP_WATCH_DOLLAR_VOLUME:
+            continue
+        hits.append((sym, gap_pct, last_px, dollarv))
+
+    hits.sort(key=lambda item: (item[1], item[3]), reverse=True)
+    for sym, gap_pct, last_px, dollarv in hits[:TOP_N]:
+        sig = {
+            "symbol": sym,
+            "session_signal": "GAP",
+            "tier": "GAP_WATCH",
+            "price": last_px,
+        }
+        should_post, cache_symbol = should_post_signal(sig, signal_cache, now_s)
+        if not should_post:
+            continue
+        post_gap_watch(sym, gap_pct, last_px, float(prev_closes[sym]), dollarv)
+        mark_signal_posted(signal_cache, cache_symbol, sig, now_s)
+
+    save_signal_cache(signal_cache)
 
 # ───────────────── Alpaca 1m (RTH) ─────────────────
 def alpaca_bars_1m(symbols: List[str], start_et: datetime, end_et: datetime) -> pd.DataFrame:
@@ -562,7 +648,7 @@ def scan_once():
 
     T = THRESH[mode]
     watch_hits, full_hits = [], []
-    prev_closes = previous_closes(list(df["symbol"].unique())) if mode == "PM" else {}
+    prev_closes = previous_closes(list(df["symbol"].unique()))
 
     for sym in df["symbol"].unique():
         sdf = df[df["symbol"] == sym]
@@ -571,17 +657,13 @@ def scan_once():
 
         open_px = float(sdf.iloc[0]["open"])
         last_px = float(sdf.iloc[-1]["close"])
-        gate_price = prev_closes.get(sym, last_px) if mode == "PM" else last_px
-        if mode == "PM":
-            if not (PREV_CLOSE_PRICE_MIN <= gate_price <= PREV_CLOSE_PRICE_MAX):
-                continue
-        elif not (PRICE_MIN <= gate_price <= PRICE_MAX):
+        gate_price = prev_closes.get(sym, last_px)
+        if not (PREV_CLOSE_PRICE_MIN <= gate_price <= PREV_CLOSE_PRICE_MAX):
             continue
 
         vol = int(sdf["volume"].sum())
         dollarv = last_px * vol
-        avg_vpm = vol / max(len(sdf), 1)
-        if avg_vpm < T["AVG_VPM"]:
+        if dollarv < MIN_SIGNAL_DOLLAR_VOLUME:
             continue
 
         gap_pct = (last_px - open_px) / max(open_px, 1e-9) * 100.0
@@ -594,12 +676,12 @@ def scan_once():
             mom_pct = (float(tail3["close"].iloc[-1]) / float(tail3["close"].iloc[0]) - 1.0) * 100.0
 
         early_pass = (
-            (gap_pct >= T["EW_GAP"] and vol >= T["EW_VOL"] and dollarv >= T["EW_$VOL"]) or
-            (mom_pct >= T["EW_MOM"] and vol >= max(15_000, T["EW_VOL"]) and dollarv >= max(150_000, T["EW_$VOL"]))
+            (gap_pct >= T["EW_GAP"] and dollarv >= max(MIN_SIGNAL_DOLLAR_VOLUME, T["EW_$VOL"])) or
+            (mom_pct >= T["EW_MOM"] and dollarv >= max(MIN_SIGNAL_DOLLAR_VOLUME, T["EW_$VOL"]))
         )
         full_pass = (
-            (gap_pct >= T["FP_GAP"] and vol >= T["FP_VOL"] and dollarv >= T["FP_$VOL"]) or
-            (mom_pct >= T["FP_MOM"] and vol >= max(40_000, T["FP_VOL"]) and dollarv >= max(400_000, T["FP_$VOL"]))
+            (gap_pct >= T["FP_GAP"] and dollarv >= max(MIN_SIGNAL_DOLLAR_VOLUME, T["FP_$VOL"])) or
+            (mom_pct >= T["FP_MOM"] and dollarv >= max(MIN_SIGNAL_DOLLAR_VOLUME, T["FP_$VOL"]))
         )
 
         ref_px = open_px
@@ -686,4 +768,7 @@ def run_loop():
 
 if __name__ == "__main__":
     log("Scanner started")
-    run_loop()
+    if os.getenv("RUDIS_GAP_SCAN_ONLY", "0") == "1":
+        run_gap_watch_scan()
+    else:
+        run_loop()
