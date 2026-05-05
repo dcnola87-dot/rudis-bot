@@ -320,7 +320,7 @@ def previous_closes(symbols: List[str]) -> Dict[str, float]:
             progress=False,
             auto_adjust=False,
             group_by="ticker",
-            threads=True,
+            threads=False,
         )
     except Exception as e:
         log(f"prev close fetch err: {e}")
