@@ -379,6 +379,10 @@ def gap_watch_snapshot(symbol: str) -> Optional[tuple[float, float, float]]:
         return None
 
 
+def _chunked(values: List[str], size: int) -> List[List[str]]:
+    return [values[i:i + size] for i in range(0, len(values), size)]
+
+
 def run_gap_watch_scan() -> None:
     ts = now_et()
     mode, start_et, _ = current_window_et(ts)
@@ -391,22 +395,24 @@ def run_gap_watch_scan() -> None:
 
     signal_cache = reset_signal_cache(load_signal_cache())
     now_s = time.time()
-    hits: list[tuple[str, float, float, float]] = []
+    hits: list[tuple[str, float, float, float, float]] = []
 
-    for sym in uni:
-        snapshot = gap_watch_snapshot(sym)
-        if snapshot is None:
-            continue
-        prev_close, last_px, dollarv = snapshot
-        if not (PREV_CLOSE_PRICE_MIN <= prev_close <= PREV_CLOSE_PRICE_MAX):
-            continue
-        gap_pct = ((last_px - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
-        if gap_pct < 10.0 or dollarv < GAP_WATCH_DOLLAR_VOLUME:
-            continue
-        hits.append((sym, gap_pct, last_px, dollarv))
+    for batch in _chunked(uni, 10):
+        for sym in batch:
+            snapshot = gap_watch_snapshot(sym)
+            if snapshot is None:
+                continue
+            prev_close, last_px, dollarv = snapshot
+            if not (PREV_CLOSE_PRICE_MIN <= prev_close <= PREV_CLOSE_PRICE_MAX):
+                continue
+            gap_pct = ((last_px - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
+            if gap_pct < 10.0 or dollarv < GAP_WATCH_DOLLAR_VOLUME:
+                continue
+            hits.append((sym, gap_pct, last_px, dollarv, prev_close))
+        time.sleep(1.0)
 
     hits.sort(key=lambda item: (item[1], item[3]), reverse=True)
-    for sym, gap_pct, last_px, dollarv in hits[:TOP_N]:
+    for sym, gap_pct, last_px, dollarv, prev_close in hits[:TOP_N]:
         sig = {
             "symbol": sym,
             "session_signal": "GAP",

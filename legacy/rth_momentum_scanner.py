@@ -40,6 +40,7 @@ ASSETS_CACHE_PATH = Path(os.getenv("RTH_ASSETS_CACHE_PATH", ".assets_cache.json"
 SIGNAL_CACHE_PATH = Path(os.getenv("RTH_SIGNAL_CACHE_PATH", ".rth_signal_cache.json"))
 SIGNAL_LOG_PATH = Path(os.getenv("RTH_SIGNAL_LOG_PATH", "logs/stock_signal_calls.jsonl"))
 ERROR_CACHE_PATH = Path(os.getenv("RTH_ERROR_CACHE_PATH", ".rth_error_cache.json"))
+STALE_VOLUME_CACHE_PATH = Path(os.getenv("RTH_STALE_VOLUME_CACHE_PATH", ".rth_stale_volume_cache.json"))
 SYMBOL_SOURCE = os.getenv("RTH_SYMBOL_SOURCE", "dynamic").strip().lower()
 
 # ---- Tunables (RTH params) ----
@@ -72,7 +73,9 @@ DEBUG_MISS_SYMBOLS = {
     for s in (os.getenv("STOCK_DEBUG_SYMBOLS", "") or "").split(",")
     if s.strip()
 }
-DEBUG_MISS_SYMBOLS.update({"SOBR", "CNSP", "KIDZ"})
+DEBUG_MISS_SYMBOLS.update({"SOBR", "CNSP", "KIDZ", "RXT"})
+SESSION_DEBUG_SYMBOLS: set[str] = set()
+SESSION_DEBUG_DAY = ""
 POST_NO_SIGNAL = os.getenv("STOCK_POST_NO_SIGNAL", os.getenv("RTH_POST_NO_SIGNAL", "0")) == "1"
 REJECTION_SUMMARY_LIMIT = int(os.getenv("RTH_REJECTION_SUMMARY_LIMIT", "10"))
 RTH_CHUNK_SIZE = int(os.getenv("RTH_CHUNK_SIZE", "25"))
@@ -107,10 +110,10 @@ TIER_PROFILES = {
         "label": "CONFIRMED",
         "price_min": 0.10,
         "price_max": 25.0,
-        "min_dollar_volume": MIN_SIGNAL_DOLLAR_VOLUME,
+        "min_dollar_volume": 400_000.0,
         "min_rvol": 3.0,
         "min_pct": 5.0,
-        "min_spike": max(VOL_SPIKE_X, 2.0),
+        "min_spike": 1.3,
         "max_pct": None,
         "timeframe": CONFIRMED_TIMEFRAME,
         "lookback_bars": CONFIRMED_LOOKBACK_BARS,
@@ -197,7 +200,23 @@ def debug_miss_enabled(symbol: str | None = None) -> bool:
         return False
     if symbol is None:
         return True
-    return symbol.upper() in DEBUG_MISS_SYMBOLS
+    upper = symbol.upper()
+    return upper in DEBUG_MISS_SYMBOLS or upper in SESSION_DEBUG_SYMBOLS
+
+
+def reset_session_debug_symbols() -> None:
+    global SESSION_DEBUG_DAY, SESSION_DEBUG_SYMBOLS
+    today = datetime.now(CT).strftime("%Y-%m-%d")
+    if SESSION_DEBUG_DAY != today:
+        SESSION_DEBUG_DAY = today
+        SESSION_DEBUG_SYMBOLS = set()
+
+
+def track_session_debug_symbol(sig: dict) -> None:
+    reset_session_debug_symbols()
+    tier = str(sig.get("tier") or "").upper()
+    if tier in {"CONFIRMED", "CASINO"}:
+        SESSION_DEBUG_SYMBOLS.add(str(sig["symbol"]).upper())
 
 
 def debug_miss(symbol: str, stage: str, detail: str):
@@ -247,6 +266,52 @@ def save_error_cache(cache: dict):
         ERROR_CACHE_PATH.write_text(json.dumps(cache))
     except Exception:
         pass
+
+
+def load_stale_volume_cache() -> dict:
+    if STALE_VOLUME_CACHE_PATH.exists():
+        try:
+            raw = json.loads(STALE_VOLUME_CACHE_PATH.read_text())
+            if isinstance(raw, dict):
+                raw.setdefault("day", "")
+                raw.setdefault("symbols", {})
+                return raw
+        except Exception:
+            pass
+    return {"day": "", "symbols": {}}
+
+
+def save_stale_volume_cache(cache: dict):
+    try:
+        STALE_VOLUME_CACHE_PATH.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+
+def reset_stale_volume_cache(cache: dict) -> dict:
+    today = datetime.now(CT).strftime("%Y-%m-%d")
+    if cache.get("day") != today:
+        return {"day": today, "symbols": {}}
+    cache.setdefault("symbols", {})
+    return cache
+
+
+def should_skip_stale_volume(symbol: str, volume: int, cache: dict) -> bool:
+    cache.setdefault("symbols", {})
+    entry = (cache["symbols"].get(symbol.upper()) or {})
+    last_volume = int(entry.get("last_volume") or 0)
+    stale_count = int(entry.get("stale_count") or 0)
+
+    if volume > 0 and volume == last_volume:
+        stale_count += 1
+    else:
+        stale_count = 0
+
+    cache["symbols"][symbol.upper()] = {
+        "last_volume": volume,
+        "stale_count": stale_count,
+    }
+    return stale_count >= 3
 
 
 def _shorten_text(value: str, limit: int = 220) -> str:
@@ -1484,8 +1549,10 @@ def main():
             discord("🧪 RTH scanner skipped: weekend.")
         return
 
+    reset_session_debug_symbols()
     syms = load_symbols()
     signal_cache = reset_signal_cache(load_signal_cache())
+    stale_volume_cache = reset_stale_volume_cache(load_stale_volume_cache())
     now_ts = time.time()
     chunk_failures = 0
     chunk_successes = 0
@@ -1534,17 +1601,27 @@ def main():
         chunk_successes += 1
 
         for sym in chunk:
+            snapshot = snapshots.get(sym) or {}
+            try:
+                daily_volume = int(((snapshot.get("dailyBar") or {}).get("v")) or 0)
+            except (TypeError, ValueError):
+                daily_volume = 0
+            if should_skip_stale_volume(sym, daily_volume, stale_volume_cache):
+                if debug_miss_enabled(sym):
+                    debug_miss(sym, "result", f"not_alerted stale_volume volume={daily_volume}")
+                continue
             sig, rejection = analyze_symbol(
                 sym,
                 {
                     EARLY_TIMEFRAME: early_bars_map.get(sym) or [],
                     CONFIRMED_TIMEFRAME: confirmed_bars_map.get(sym) or [],
                 },
-                snapshots.get(sym) or {},
+                snapshot,
             )
             if sig:
                 should_post, cache_symbol = should_post_signal(sig, signal_cache, now_ts)
                 if should_post:
+                    track_session_debug_symbol(sig)
                     discord(format_msg(sig))
                     append_signal_log(sig)
                     mark_signal_posted(signal_cache, cache_symbol, sig, now_ts)
@@ -1558,6 +1635,7 @@ def main():
         time.sleep(0.25)
 
     save_signal_cache(signal_cache)
+    save_stale_volume_cache(stale_volume_cache)
     print_rejection_summary(rejections)
 
     if hits == 0 and chunk_successes > 0 and (POST_NO_SIGNAL or DEBUG_RTH):

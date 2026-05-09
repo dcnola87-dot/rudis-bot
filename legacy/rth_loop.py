@@ -90,7 +90,7 @@ while True:
         # Run scanner on a tighter cadence during active windows.
         env = os.environ.copy()
         if session == "rth":
-            env["RTH_ALLOWED_SIGNALS"] = "WATCH,EARLY,CASINO,CONFIRMED,FADING"
+            env["RTH_ALLOWED_SIGNALS"] = "WATCH,EARLY,CASINO,CONFIRMED,EXTENDED,FADING"
         else:
             env["RTH_ALLOWED_SIGNALS"] = "EARLY,CASINO,CONFIRMED"
         subprocess.run([sys.executable, "rth_momentum_scanner.py"], env=env)
