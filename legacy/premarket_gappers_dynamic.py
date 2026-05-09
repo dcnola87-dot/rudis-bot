@@ -350,6 +350,35 @@ def previous_closes(symbols: List[str]) -> Dict[str, float]:
     return closes
 
 
+def gap_watch_snapshot(symbol: str) -> Optional[tuple[float, float, float]]:
+    ysym = clean_sym(symbol)
+    try:
+        ticker = yf.Ticker(ysym)
+        previous_close = float((ticker.fast_info or {}).get("previous_close") or 0.0)
+        if previous_close <= 0:
+            return None
+
+        df = yf.download(
+            ysym,
+            period="1d",
+            interval="1m",
+            prepost=True,
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        if df is None or df.empty:
+            return None
+
+        df = df.rename(columns={"Close": "close", "Volume": "volume"})
+        last_px = float(df["close"].dropna().iloc[-1])
+        volume = int(df["volume"].fillna(0).sum())
+        return previous_close, last_px, float(last_px * volume)
+    except Exception as e:
+        log(f"gap watch snapshot err {symbol}: {e}")
+        return None
+
+
 def run_gap_watch_scan() -> None:
     ts = now_et()
     mode, start_et, _ = current_window_et(ts)
@@ -360,30 +389,18 @@ def run_gap_watch_scan() -> None:
     if not uni:
         return
 
-    prev_closes = previous_closes(uni)
-    candidates = [sym for sym in uni if PREV_CLOSE_PRICE_MIN <= prev_closes.get(sym, 0.0) <= PREV_CLOSE_PRICE_MAX]
-    if not candidates:
-        return
-
-    df = yahoo_1m(candidates, start_et, ts)
-    if df.empty:
-        return
-
     signal_cache = reset_signal_cache(load_signal_cache())
     now_s = time.time()
     hits: list[tuple[str, float, float, float]] = []
 
-    for sym in df["symbol"].unique():
-        sdf = df[df["symbol"] == sym]
-        if sdf.empty:
+    for sym in uni:
+        snapshot = gap_watch_snapshot(sym)
+        if snapshot is None:
             continue
-        prev_close = float(prev_closes.get(sym) or 0.0)
+        prev_close, last_px, dollarv = snapshot
         if not (PREV_CLOSE_PRICE_MIN <= prev_close <= PREV_CLOSE_PRICE_MAX):
             continue
-        last_px = float(sdf.iloc[-1]["close"])
-        vol = int(sdf["volume"].sum())
-        dollarv = last_px * vol
-        gap_pct = ((last_px / prev_close) - 1.0) * 100.0 if prev_close > 0 else 0.0
+        gap_pct = ((last_px - prev_close) / prev_close) * 100.0 if prev_close > 0 else 0.0
         if gap_pct < 10.0 or dollarv < GAP_WATCH_DOLLAR_VOLUME:
             continue
         hits.append((sym, gap_pct, last_px, dollarv))
@@ -399,7 +416,7 @@ def run_gap_watch_scan() -> None:
         should_post, cache_symbol = should_post_signal(sig, signal_cache, now_s)
         if not should_post:
             continue
-        post_gap_watch(sym, gap_pct, last_px, float(prev_closes[sym]), dollarv)
+        post_gap_watch(sym, gap_pct, last_px, prev_close, dollarv)
         mark_signal_posted(signal_cache, cache_symbol, sig, now_s)
 
     save_signal_cache(signal_cache)
